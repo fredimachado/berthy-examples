@@ -26,6 +26,7 @@ func TestResolve(t *testing.T) {
 		{[]string{"/app/bin/healthcheck"}, "healthcheck", nil},
 		{[]string{"todo-api", "migrate", "version"}, "migrate", []string{"version"}},
 		{[]string{"todo-api", "healthcheck"}, "healthcheck", nil},
+		{[]string{"todo-api", "version"}, "version", nil},
 		{[]string{"todo-api", "bogus"}, "bogus", nil},
 	}
 	for _, tc := range cases {
@@ -126,5 +127,15 @@ func TestHealthcheckExitCodeFollowsTheHealthEndpoint(t *testing.T) {
 	srv.Close()
 	if err := healthcheck(context.Background(), nil, e); err == nil {
 		t.Fatal("a server that is gone must fail the check")
+	}
+}
+
+func TestVersionCommandPrintsTheStampedBuild(t *testing.T) {
+	e := envOf(nil)
+	if err := printVersion(context.Background(), nil, e); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.stdout.(*bytes.Buffer).String(); got != "dev unknown\n" {
+		t.Fatalf("output = %q", got)
 	}
 }

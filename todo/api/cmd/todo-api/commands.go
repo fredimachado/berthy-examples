@@ -257,3 +257,13 @@ func healthcheck(ctx context.Context, args []string, e env) error {
 	}
 	return nil
 }
+
+// printVersion prints the stamped build version and commit, so a pushed image
+// can be checked without starting the server.
+func printVersion(_ context.Context, args []string, e env) error {
+	if len(args) > 0 {
+		return errors.New("usage: version")
+	}
+	fmt.Fprintf(e.stdout, "%s %s\n", version.Version, version.Commit)
+	return nil
+}

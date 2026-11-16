@@ -22,12 +22,14 @@ const usage = `usage: todo-api [serve]
        todo-api warm-cache
        todo-api cleanup [--done-older-than 30d]
        todo-api healthcheck
+       todo-api version
 
 Settings come from the environment: PORT, LOG_LEVEL, DB_HOST, DB_PORT, DB_NAME,
 DB_USER, POSTGRES_PASSWORD, REDIS_HOST, REDIS_PORT, REDIS_PASSWORD.`
 
 var commands = map[string]func(ctx context.Context, args []string, env env) error{
 	"serve":       serve,
+	"version":     printVersion,
 	"migrate":     runMigrate,
 	"warm-cache":  warmCache,
 	"cleanup":     cleanup,
