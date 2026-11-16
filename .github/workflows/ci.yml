@@ -1,0 +1,173 @@
+name: CI
+
+# release.yml calls this workflow first, so a release is only published after
+# the same checks pass on the same commit.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # A newer push replaces a running pull request check. A push to main always finishes.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: Format and vet
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: todo/api
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: todo/api/go.mod
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: |
+          go vet ./...
+          go vet -tags integration ./...
+
+  test:
+    name: Tests with Postgres and Redis
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: todo/api
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          # A throwaway database that exists only for this job.
+          POSTGRES_PASSWORD: ci-only
+          POSTGRES_DB: todo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d todo_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_POSTGRES_URL: postgres://postgres:ci-only@localhost:5432/todo_test?sslmode=disable
+      TEST_REDIS_ADDR: localhost:6379
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: todo/api/go.mod
+
+      # The integration tag turns on the tests that use the two services above.
+      - name: Run tests with the race detector
+        run: go test -race -count=1 -tags integration -v ./...
+
+  image:
+    name: Docker image and Compose files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Both architectures the release publishes, built and not pushed.
+      - name: Build the image for amd64 and arm64
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: todo/api
+          platforms: linux/amd64,linux/arm64
+          push: false
+
+      - name: Build the image and load it
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: todo/api
+          load: true
+          tags: todo-api:ci
+          build-args: |
+            VERSION=ci
+            COMMIT=${{ github.sha }}
+
+      # The linked names must dispatch to the right command, and a missing
+      # variable must stop the command with a message that names it.
+      - name: Smoke test the image
+        run: |
+          docker run --rm todo-api:ci /app/bin/todo-api version | grep -q "^ci ${GITHUB_SHA}$"
+          set +e
+          out=$(docker run --rm todo-api:ci /app/bin/migrate version 2>&1)
+          status=$?
+          set -e
+          echo "$out"
+          [ "$status" -eq 1 ]
+          echo "$out" | grep -q "missing environment variables: DB_HOST"
+          test "$(docker image inspect todo-api:ci --format '{{.Config.User}}')" = "65532"
+
+      - name: Validate the Compose files
+        env:
+          POSTGRES_DB: todo
+          POSTGRES_USER: todo
+          POSTGRES_PASSWORD: ci-only
+          REDIS_PASSWORD: ci-only
+        run: |
+          docker compose -f todo/compose.dev.yml config --quiet
+          docker compose -f todo/berthy/deploy/postgres.yml config --quiet
+          docker compose -f todo/berthy/deploy/redis.yml config --quiet
+
+  # The Berthy manifests are checked with `berthy config validate`, which needs
+  # the berthy binary. It comes from the private repository fredimachado/berthy,
+  # which this repository's GITHUB_TOKEN cannot read, so that check is not run
+  # here. Run it on your machine before you push a manifest change:
+  #   berthy config validate -e dev  --manifest-dir todo/berthy
+  #   berthy config validate -e prod --manifest-dir todo/berthy
+
+  lint-actions:
+    name: GitHub Actions audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run actionlint
+        uses: rhysd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
+
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1
+        with:
+          advanced-security: false
