@@ -34,6 +34,7 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: todo/api/go.mod
+          cache-dependency-path: todo/api/go.sum
 
       - name: Check formatting
         run: |
@@ -90,6 +91,7 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: todo/api/go.mod
+          cache-dependency-path: todo/api/go.sum
 
       # The integration tag turns on the tests that use the two services above.
       - name: Run tests with the race detector
