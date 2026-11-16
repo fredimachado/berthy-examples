@@ -1,0 +1,9 @@
+# Local build output
+/todo/api/bin/
+*.exe
+*.test
+*.out
+
+# Local overrides, never committed
+.env
+*.local
