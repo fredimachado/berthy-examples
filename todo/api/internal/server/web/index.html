@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Todo</title>
+<style>
+  :root { color-scheme: light dark; --accent: #2563eb; --muted: #6b7280; --line: #d1d5db; }
+  * { box-sizing: border-box; }
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 34rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { margin: 0 0 1rem; font-size: 1.6rem; }
+  form { display: flex; gap: .5rem; margin-bottom: 1rem; }
+  input[type=text] { flex: 1; padding: .5rem; font: inherit; border: 1px solid var(--line); border-radius: .4rem; background: transparent; color: inherit; }
+  button { font: inherit; padding: .5rem .9rem; border: 0; border-radius: .4rem; background: var(--accent); color: #fff; cursor: pointer; }
+  button.link { background: none; color: var(--muted); padding: .25rem .5rem; }
+  button.link:hover { color: #dc2626; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { display: flex; align-items: center; gap: .6rem; padding: .5rem 0; border-bottom: 1px solid var(--line); }
+  li span { flex: 1; word-break: break-word; }
+  li.done span { text-decoration: line-through; color: var(--muted); }
+  .meta { margin-top: 1rem; font-size: .85rem; color: var(--muted); display: flex; justify-content: space-between; }
+  .badge { padding: .05rem .5rem; border-radius: 1rem; border: 1px solid var(--line); }
+  .badge.hit { color: #15803d; border-color: #15803d; }
+  .badge.miss { color: #b45309; border-color: #b45309; }
+  #error { color: #dc2626; min-height: 1.5rem; }
+  .empty { color: var(--muted); padding: .5rem 0; }
+</style>
+</head>
+<body>
+<h1>Todo</h1>
+<form id="add">
+  <input id="title" type="text" maxlength="200" placeholder="What needs doing?" autocomplete="off" required>
+  <button type="submit">Add</button>
+</form>
+<div id="error" role="alert"></div>
+<ul id="list"></ul>
+<div class="meta">
+  <span>List from: <span id="source" class="badge">...</span></span>
+  <span id="version">version ...</span>
+</div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+
+async function call(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    let msg = res.status + " " + res.statusText;
+    try { msg = (await res.json()).error || msg; } catch (_) {}
+    throw new Error(msg);
+  }
+  return res;
+}
+
+function row(t) {
+  const li = document.createElement("li");
+  if (t.done) li.className = "done";
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.checked = t.done;
+  box.addEventListener("change", () => act(() => call("PATCH", "/api/todos/" + t.id, { done: box.checked })));
+  const title = document.createElement("span");
+  title.textContent = t.title;
+  const del = document.createElement("button");
+  del.type = "button";
+  del.className = "link";
+  del.textContent = "Delete";
+  del.addEventListener("click", () => act(() => call("DELETE", "/api/todos/" + t.id)));
+  li.append(box, title, del);
+  return li;
+}
+
+async function load() {
+  const res = await call("GET", "/api/todos");
+  const todos = await res.json();
+  const list = $("list");
+  list.replaceChildren();
+  if (todos.length === 0) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = "Nothing to do.";
+    list.append(li);
+  }
+  for (const t of todos) list.append(row(t));
+  const hit = res.headers.get("X-Cache") === "hit";
+  const src = $("source");
+  src.textContent = hit ? "cache (Redis)" : "database (Postgres)";
+  src.className = "badge " + (hit ? "hit" : "miss");
+}
+
+async function act(fn) {
+  $("error").textContent = "";
+  try { await fn(); await load(); } catch (e) { $("error").textContent = e.message; }
+}
+
+$("add").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const title = $("title").value;
+  act(async () => { await call("POST", "/api/todos", { title }); $("title").value = ""; });
+});
+
+act(async () => {});
+call("GET", "/version").then((r) => r.json()).then((v) => {
+  $("version").textContent = "version " + v.version + " (" + v.commit.slice(0, 7) + ")";
+}).catch(() => {});
+</script>
+</body>
+</html>
