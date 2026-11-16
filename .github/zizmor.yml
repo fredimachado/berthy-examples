@@ -1,0 +1,7 @@
+rules:
+  # release.yml calls ci.yml with ./.github/workflows/ci.yml, which GitHub
+  # resolves to the same commit. That is the point: the tests run on the commit
+  # that gets published.
+  self-repository:
+    ignore:
+      - release.yml
