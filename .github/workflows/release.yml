@@ -1,0 +1,158 @@
+name: Release
+
+# Every push to main that passes the checks publishes a version, v1.0.<run number>:
+# the image ghcr.io/fredimachado/todo-api, a git tag on the built commit and a
+# GitHub release whose notes carry the image digest and the deploy commands.
+# Berthy's protected environments deploy by that digest.
+#
+# The checks come from ci.yml, called as the first job: the tests run on the
+# commit that is published, and one file describes them. (The other way, a
+# workflow_run trigger on CI, runs the release from the default branch's latest
+# commit rather than the tested one, so it has to look the commit up and can
+# publish a different one.)
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One release at a time, in push order. A run waits for the one in front of
+# it, so two pushes never publish out of order. If several pile up, GitHub
+# keeps the newest and drops the ones in between: the newest commit is the
+# one that gets published.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/fredimachado/todo-api
+  VERSION: v1.0.${{ github.run_number }}
+
+jobs:
+  checks:
+    name: Checks
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish ${{ format('v1.0.{0}', github.run_number) }}
+    needs: checks
+    # Never publish from a branch other than main, even when started by hand.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the tag and the release
+      packages: write # push the image
+    steps:
+      - name: Check out the commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Work out the image tags
+        id: tags
+        run: |
+          short=$(git rev-parse --short=7 HEAD)
+          {
+            echo "list<<EOF"
+            echo "$IMAGE:$VERSION"
+            echo "$IMAGE:latest"
+            echo "$IMAGE:sha-$short"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # The image is cross-compiled by the Dockerfile, so arm64 needs no emulation.
+      # No provenance attestation: the digest then names an index of exactly two images.
+      - name: Build and push the image
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: todo/api
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ steps.tags.outputs.list }}
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            COMMIT=${{ github.sha }}
+
+      # Check what was pushed, by digest, the way Berthy will pull it.
+      - name: Check the pushed image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          printf '%s\n' "$DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          docker buildx imagetools inspect "$IMAGE@$DIGEST" | tee inspect.txt
+          grep -q "linux/amd64" inspect.txt
+          grep -q "linux/arm64" inspect.txt
+          docker run --rm "$IMAGE@$DIGEST" /app/bin/todo-api version | tee version.txt
+          grep -q "^$VERSION $GITHUB_SHA$" version.txt
+
+      - name: Write the release notes
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          short=$(git rev-parse --short=7 HEAD)
+          cat > notes.md <<EOF
+          Todo API \`$VERSION\`, built from commit \`$GITHUB_SHA\`.
+
+          ## Image
+
+          \`\`\`
+          $IMAGE:$VERSION
+          $IMAGE:latest
+          $IMAGE:sha-$short
+          $IMAGE@$DIGEST
+          \`\`\`
+
+          Digest: \`$DIGEST\` (linux/amd64 and linux/arm64)
+
+          ## Deploy with Berthy
+
+          Dev takes a tag:
+
+          \`\`\`
+          berthy deploy api -e dev --version $VERSION
+          \`\`\`
+
+          Prod is protected and takes only the digest:
+
+          \`\`\`
+          berthy deploy api -e prod --version $DIGEST
+          \`\`\`
+
+          See [todo/README.md](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/todo/README.md) for the whole walk-through.
+          EOF
+          cat notes.md
+
+      # gh creates the tag on the built commit together with the release. It
+      # does not start other workflows, because the token is GITHUB_TOKEN.
+      - name: Create the tag and the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            # A re-run of this workflow run: the release exists, so update its notes.
+            gh release edit "$VERSION" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
+          else
+            gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "$VERSION" --notes-file notes.md
+          fi
+          echo "Published $VERSION: $IMAGE@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
