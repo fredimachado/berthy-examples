@@ -1,0 +1,27 @@
+# The todo cache. Berthy deploys this file as the Compose app "redis".
+# It reads REDIS_PASSWORD from env.secret of the manifest.
+services:
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    # A cache: nothing is saved to disk.
+    command:
+      - sh
+      - -c
+      - exec redis-server --requirepass "$$REDIS_PASSWORD" --save "" --appendonly no
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      todo:
+        aliases:
+          - todo-redis
+
+networks:
+  todo:
+    external: true
+    name: todo

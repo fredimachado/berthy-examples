@@ -1,0 +1,6 @@
+# The dev environment: one replica, debug logs, no backups, no alerts.
+apps:
+  api:
+    env:
+      plain:
+        LOG_LEVEL: debug

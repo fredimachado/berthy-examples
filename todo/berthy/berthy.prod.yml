@@ -1,0 +1,37 @@
+# The prod environment: protected (it deploys by image digest, never by tag),
+# two replicas and resource limits.
+protected: true
+
+apps:
+  api:
+    roles:
+      web:
+        replicas: 2
+        resources:
+          cpu: "1.0"
+          memory: 512M
+        # To publish the app on a public hostname, enable managed ingress
+        # (see the end of this file) and add your hostname here:
+        # hostnames:
+        #   - todo.example.com
+
+# The blocks below need services of your own (object storage, Cloudflare,
+# Telegram, an OpenTelemetry collector), so they are left out and Berthy runs
+# without them. The finished, validated versions are in the Berthy repository,
+# examples/todo/berthy.prod.yml, and the user guide explains each one:
+#
+#   destinations, backups, state_backup   nightly database dumps and agent state to S3-compatible storage
+#                                         (and `hooks.pre_deploy: [{backup: main-db}]` on the api, to dump before each deploy)
+#   probes, peers, alerts                 scheduled checks, a second agent that watches this one, Telegram alerts
+#   telemetry                             metrics to an OpenTelemetry collector
+#
+# Managed ingress, which publishes the hostnames above through a Cloudflare Tunnel:
+#
+# ingress:
+#   cloudflare:
+#     account_id: <your Cloudflare account id>
+#     api_token_secret: CLOUDFLARE_API_TOKEN
+#     image: cloudflare/cloudflared:2024.12.2
+#     replicas: 1
+#     tunnel: todo-prod
+#     dns: true

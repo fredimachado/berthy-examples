@@ -1,0 +1,104 @@
+# The todo app: one project, three apps, one shared network.
+# This is the base manifest. berthy.dev.yml and berthy.prod.yml change it per environment.
+# The apps are described in ../README.md; the manifest keys are in the Berthy user guide.
+project: todo
+network: todo
+
+# The credential Berthy uses to pull todo-api from the private registry.
+# Store the token with: berthy secret set GHCR_TOKEN --registry ghcr.io -e ENV
+# (a GitHub token that can read packages; see ../README.md).
+registries:
+  ghcr.io:
+    username: fredimachado
+    password_secret: GHCR_TOKEN
+
+apps:
+  # An image app: a stateless web service, run as a Swarm service named todo-api-web.
+  api:
+    kind: image
+    image: ghcr.io/fredimachado/todo-api
+    roles:
+      web:
+        replicas: 1
+        port: 8080
+        health:
+          # The image has no curl: /app/bin/healthcheck calls http://127.0.0.1:$PORT/health.
+          test: ["CMD", "/app/bin/healthcheck"]
+          interval: 15s
+          timeout: 5s
+          start_period: 30s
+          retries: 3
+    env:
+      plain:
+        DB_HOST: todo-db
+        DB_PORT: "5432"
+        DB_NAME: todo
+        DB_USER: todo
+        REDIS_HOST: todo-redis
+        LOG_LEVEL: info
+      secret:
+        - POSTGRES_PASSWORD
+        - REDIS_PASSWORD
+    deploy:
+      deploy_timeout: 120s
+      drain_timeout: 30s
+      start_attempts: 3
+      retain: 5
+    migrations:
+      version: ["/app/bin/migrate", "version"]
+      apply: ["/app/bin/migrate", "up"]
+      revert: ["/app/bin/migrate", "down-to", "{target}"]
+      timeout: 5m
+      retries: 0
+    hooks:
+      post_deploy:
+        - run: ["/app/bin/warm-cache"]
+          timeout: 2m
+          retries: 2
+
+  # A stateful Compose app: the database. Only a command that names it can recreate it.
+  postgres:
+    kind: compose
+    file: deploy/postgres.yml
+    stateful: true
+    env:
+      plain:
+        POSTGRES_DB: todo
+        POSTGRES_USER: todo
+      secret:
+        - POSTGRES_PASSWORD
+
+  # A Compose app that holds no data worth keeping: the cache.
+  redis:
+    kind: compose
+    file: deploy/redis.yml
+    env:
+      secret:
+        - REDIS_PASSWORD
+
+jobs:
+  # Runs in the postgres container. It has no schedule, so it runs on demand
+  # (berthy job run dump-db), and it is the "before" step of a volume backup
+  # when you add one (see the note in berthy.prod.yml).
+  dump-db:
+    app: postgres
+    service: postgres
+    timeout: 10m
+    command:
+      - sh
+      - -ec
+      - |
+        umask 077
+        tmp=$(mktemp /backups/.latest.XXXXXX)
+        trap 'rm -f "$tmp"' EXIT
+        PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -Fc --no-acl --no-owner \
+          -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f "$tmp"
+        mv -f "$tmp" /backups/latest.dump
+
+  # A scheduled job in the api container: every day at 02:30 UTC.
+  cleanup:
+    app: api
+    role: web
+    schedule: "30 2 * * *"
+    timeout: 15m
+    command: ["/app/bin/cleanup", "--done-older-than", "30d"]
