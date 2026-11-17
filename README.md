@@ -25,3 +25,7 @@ with `berthy config validate -e dev --manifest-dir todo/berthy` (and `-e prod`).
 
 For the user guide, see the
 [Berthy repository](https://github.com/fredimachado/berthy/blob/main/docs/user-guide.md).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
