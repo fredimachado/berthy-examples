@@ -33,6 +33,9 @@ type Todos interface {
 type BuildInfo struct {
 	Version string `json:"version"`
 	Commit  string `json:"commit"`
+	// Replica names the container that answers: its host name, which Docker sets to the short container id. Each replica
+	// of a scaled service has its own, so it shows which one served a request.
+	Replica string `json:"replica,omitempty"`
 }
 
 // maxBody is the largest request body: a title is at most 200 characters.
@@ -52,7 +55,19 @@ func New(todos Todos, build BuildInfo, log *slog.Logger) http.Handler {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 	})
-	return s.recoverer(s.logRequests(mux))
+	return s.recoverer(s.logRequests(s.servedBy(mux)))
+}
+
+// servedBy sets X-Served-By to the replica name on every response, so a client
+// can see which container of a scaled service answered. It sets the header
+// before the handler writes anything.
+func (s *server) servedBy(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.build.Replica != "" {
+			w.Header().Set("X-Served-By", s.build.Replica)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 type server struct {

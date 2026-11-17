@@ -21,11 +21,16 @@ type fixture struct {
 }
 
 func newFixture() *fixture {
+	return newFixtureWith(server.BuildInfo{Version: "v1.2.3", Commit: "abc1234", Replica: "replica-1"})
+}
+
+// newFixtureWith builds the server with the given build info.
+func newFixtureWith(build server.BuildInfo) *fixture {
 	st, ca := &memory.Store{}, &memory.Cache{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := todo.NewService(st, ca, log)
 	return &fixture{
-		h:     server.New(svc, server.BuildInfo{Version: "v1.2.3", Commit: "abc1234"}, log),
+		h:     server.New(svc, build, log),
 		store: st,
 		cache: ca,
 	}
@@ -84,8 +89,46 @@ func TestHealth(t *testing.T) {
 func TestVersion(t *testing.T) {
 	rec := newFixture().do("GET", "/version", "")
 	wantStatus(t, rec, 200)
-	if got := decodeBody[server.BuildInfo](t, rec); got.Version != "v1.2.3" || got.Commit != "abc1234" {
+	if got := decodeBody[server.BuildInfo](t, rec); got.Version != "v1.2.3" || got.Commit != "abc1234" || got.Replica != "replica-1" {
 		t.Fatalf("body = %+v", got)
+	}
+}
+
+func TestServedByHeader(t *testing.T) {
+	f := newFixture()
+	for _, tc := range []struct {
+		method, path, body string
+	}{
+		{"GET", "/version", ""},
+		{"GET", "/api/todos", ""},
+		{"GET", "/health", ""},
+		{"GET", "/", ""},
+		{"GET", "/nope", ""},
+		{"POST", "/api/todos", `{"title":""}`}, // an error response too
+	} {
+		rec := f.do(tc.method, tc.path, tc.body)
+		if got := rec.Header().Get("X-Served-By"); got != "replica-1" {
+			t.Errorf("%s %s: X-Served-By = %q, want replica-1 (status %d)", tc.method, tc.path, got, rec.Code)
+		}
+	}
+}
+
+func TestWithoutReplicaThereIsNoHeaderAndNoField(t *testing.T) {
+	f := newFixtureWith(server.BuildInfo{Version: "v1.2.3", Commit: "abc1234"})
+	for _, path := range []string{"/version", "/api/todos", "/health", "/", "/nope"} {
+		rec := f.do("GET", path, "")
+		if values := rec.Header().Values("X-Served-By"); len(values) != 0 {
+			t.Errorf("GET %s: X-Served-By = %q, want none", path, values)
+		}
+	}
+	rec := f.do("GET", "/version", "")
+	wantStatus(t, rec, 200)
+	got := decodeBody[map[string]any](t, rec)
+	if got["version"] != "v1.2.3" {
+		t.Fatalf("body = %v", got)
+	}
+	if _, ok := got["replica"]; ok {
+		t.Fatalf("body has a replica field: %s", rec.Body)
 	}
 }
 

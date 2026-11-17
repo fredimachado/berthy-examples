@@ -37,6 +37,7 @@
 <div class="meta">
   <span>List from: <span id="source" class="badge">...</span></span>
   <span id="version">version ...</span>
+  <span>served by <span id="replica" class="badge">...</span></span>
 </div>
 <script>
 "use strict";
@@ -48,6 +49,8 @@ async function call(method, path, body) {
     headers: body ? { "Content-Type": "application/json" } : {},
     body: body ? JSON.stringify(body) : undefined,
   });
+  const replica = res.headers.get("X-Served-By");
+  if (replica) $("replica").textContent = replica;
   if (!res.ok) {
     let msg = res.status + " " + res.statusText;
     try { msg = (await res.json()).error || msg; } catch (_) {}

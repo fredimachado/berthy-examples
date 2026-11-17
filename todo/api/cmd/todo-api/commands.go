@@ -54,6 +54,18 @@ func openService(cfg config.Config, log *slog.Logger) (*todo.Service, func(), er
 	return todo.NewService(store.New(pool), cache.New(rdb, cache.Key, cache.TTL), log), closeAll, nil
 }
 
+// hostname is the name Docker gives the container: its short id, which tells
+// the replicas of a scaled service apart. It is "" when the system cannot say,
+// and the API then reports no replica. That never stops the start.
+func hostname(log *slog.Logger) string {
+	name, err := os.Hostname()
+	if err != nil {
+		log.Warn("host name unknown, responses will not name the replica", "error", err)
+		return ""
+	}
+	return name
+}
+
 func serve(ctx context.Context, args []string, e env) error {
 	if len(args) > 0 {
 		return fmt.Errorf("serve takes no arguments\n%s", usage)
@@ -69,9 +81,10 @@ func serve(ctx context.Context, args []string, e env) error {
 	}
 	defer closeAll()
 
+	build := server.BuildInfo{Version: version.Version, Commit: version.Commit, Replica: hostname(log)}
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
-		Handler:           server.New(svc, server.BuildInfo{Version: version.Version, Commit: version.Commit}, log),
+		Handler:           server.New(svc, build, log),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,

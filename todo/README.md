@@ -37,9 +37,9 @@ password never appears in a message or a log.
 
 | Request | What it does |
 | --- | --- |
-| `GET /` | A small web page to add, tick and delete todos. It shows the version and whether the list came from the cache or from the database. |
+| `GET /` | A small web page to add, tick and delete todos. It shows the version, whether the list came from the cache or from the database, and which replica answered. |
 | `GET /health` | `200 {"status":"ok"}` when Postgres and Redis both answer within 2 seconds, else `503` with the name of the one that failed. |
-| `GET /version` | The build version and commit. |
+| `GET /version` | The build version, the commit and the replica (the container that answered). |
 | `GET /api/todos` | The list. It is served from Redis (key `todo:list`, 60 seconds) and filled from Postgres on a miss. The `X-Cache` header says `hit` or `miss`. |
 | `POST /api/todos` | `{"title": "..."}` creates a todo. The title has 1 to 200 characters. |
 | `PATCH /api/todos/{id}` | `{"title": "...", "done": true}`, either field, changes a todo. |
@@ -218,3 +218,27 @@ The prod overlay leaves out what needs services of your own: backups to
 S3-compatible storage, Cloudflare ingress, probes, Telegram alerts and
 telemetry. `berthy/berthy.prod.yml` says which blocks and where to find them.
 The guide's steps 7 to 10 add them.
+
+## See which replica answered
+
+When the API runs more than one replica, each response says which container
+served it. The page's footer shows it as **served by** and updates it on every
+request. Every response also carries the name in the `X-Served-By` header, and
+`/version` reports it as `replica`. The name is the container's short id.
+
+To see the spread, scale the API to three replicas and ask for `/version` ten
+times. `https://todo.example.com` stands for your app's public address, and
+`$CFG` is set as in the deploy steps:
+
+```bash
+berthy scale api -e dev --config $CFG --replicas 3 --role web
+for i in $(seq 10); do curl -s https://todo.example.com/version; echo; done
+```
+
+`scale` changes the running replicas only. The manifest stays the source of
+truth, and a deploy applies its `replicas`, so change the manifest too.
+
+Through the Cloudflare tunnel, the connector reuses connections to the service,
+and Swarm balances per connection. One browser tab may keep landing on the same
+replica. Separate `curl` runs, each a new connection, or several clients show
+the spread.
