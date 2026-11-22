@@ -125,6 +125,8 @@ jobs:
 
           ## Deploy with Berthy
 
+          Run these from \`todo/berthy\`, so the manifest selects the project.
+
           Dev takes a tag:
 
           \`\`\`

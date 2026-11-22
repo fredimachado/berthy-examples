@@ -29,8 +29,9 @@ volumes:
   pgdata:
   db-dumps:
 
-# The shared network that berthy setup created. A Compose app must join it itself.
+# The environment network that berthy setup created. Berthy writes its name into
+# the Compose .env as BERTHY_NETWORK. A Compose app must join it itself.
 networks:
   todo:
     external: true
-    name: todo
+    name: ${BERTHY_NETWORK}

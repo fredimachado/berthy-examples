@@ -1,8 +1,8 @@
-# The todo app: one project, three apps, one shared network.
+# The todo app: one project, three apps. Each environment gets its own network
+# (default <project>-<environment>, for example todo-dev and todo-prod).
 # This is the base manifest. berthy.dev.yml and berthy.prod.yml change it per environment.
 # The apps are described in ../README.md; the manifest keys are in the Berthy user guide.
 project: todo
-network: todo
 
 # The credential Berthy uses to pull todo-api from the private registry.
 # Store the token with: berthy secret set GHCR_TOKEN --registry ghcr.io -e ENV
@@ -13,7 +13,8 @@ registries:
     password_secret: GHCR_TOKEN
 
 apps:
-  # An image app: a stateless web service, run as a Swarm service named todo-api-web.
+  # An image app: a stateless web service, run as a Swarm service named
+  # todo-<environment>-api-web (for example todo-prod-api-web).
   api:
     kind: image
     image: ghcr.io/fredimachado/todo-api

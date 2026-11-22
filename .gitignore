@@ -7,3 +7,6 @@
 # Local overrides, never committed
 .env
 *.local
+
+# Key copies saved next to the manifest must never be committed
+*.key

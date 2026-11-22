@@ -3,12 +3,16 @@
 A small todo list you can run on your machine and deploy with
 [Berthy](https://github.com/fredimachado/berthy). It is the app the Berthy
 [user guide](https://github.com/fredimachado/berthy/blob/main/docs/user-guide.md)
-describes: three Berthy apps on one Docker Swarm server per environment.
+describes: one project with three Berthy apps. Dev and prod can share one
+agent; each environment has its own overlay network (`todo-dev`, `todo-prod`).
+
+This needs a Berthy that supports projects: the next release, or a build from
+`main`. v0.2.0 does not.
 
 | Berthy app | Kind | What it is |
 | --- | --- | --- |
-| `api` | `image` | The Go API and web page, from the private image `ghcr.io/fredimachado/todo-api`. |
-| `postgres` | `compose`, `stateful` | PostgreSQL 17, reachable as `todo-db`. |
+| `api` | `image` | The Go API and web page, from the private image `ghcr.io/fredimachado/todo-api`. Swarm service `todo-<environment>-api-web`, network alias `api-web`. |
+| `postgres` | `compose`, `stateful` | PostgreSQL 17, reachable as `todo-db` on the environment network. |
 | `redis` | `compose` | Redis 7, reachable as `todo-redis`. It caches the todo list. |
 
 ```
@@ -119,7 +123,8 @@ to it in GitHub's package list.
 
 The [Berthy user guide](https://github.com/fredimachado/berthy/blob/main/docs/user-guide.md)
 explains every step. This is the short path for this app. It uses the `dev`
-environment; for `prod`, change `-e dev` to `-e prod`.
+environment; for `prod`, change `-e dev` to `-e prod` and use
+`BERTHY_TODO_PROD_TOKEN`.
 
 **You need** a Linux server with systemd, a private address on it (this README
 uses `10.0.0.5`), an account that is root or has `sudo` without a password, and
@@ -130,7 +135,8 @@ the `berthy` CLI on your machine.
    cannot read packages. Berthy uses it to pull the private image. Keep it out
    of your shell history.
 
-2. **Set up the server.** Work from the manifests' folder, so Berthy finds them:
+2. **Set up the server.** Work from the manifests' folder, so the manifest
+   supplies the project:
 
    ```bash
    cd todo/berthy
@@ -138,11 +144,23 @@ the `berthy` CLI on your machine.
    berthy setup -e dev --host ops@10.0.0.5 --listen 10.0.0.5:7710 \
      --config ~/.config/berthy/config.json
    export CFG=~/.config/berthy/config.json
-   export BERTHY_DEV_TOKEN=<the admin token setup printed>
+   export BERTHY_TODO_DEV_TOKEN=<the admin token setup printed>
    ```
 
-   Save the admin token and the server's encryption key as the setup output
-   says. `berthy setup --dry-run` shows what it would do first.
+   Save the admin token and the encryption key as the setup output says. The
+   key copy is named `todo.dev.key`. `berthy setup --dry-run` shows what it
+   would do first.
+
+   To add prod on the same server, run setup again. It keeps the listen
+   address and creates a second hosted environment with its own network
+   (`todo-prod`):
+
+   ```bash
+   berthy setup -e prod --host ops@10.0.0.5 --config $CFG
+   export BERTHY_TODO_PROD_TOKEN=<the admin token that run printed>
+   ```
+
+   That key copy is `todo.prod.key`.
 
 3. **Set the secrets.** Each value is read from standard input and is never
    printed:
@@ -181,7 +199,7 @@ the `berthy` CLI on your machine.
    and then runs the `warm-cache` hook.
 
    **Prod is protected**, so it takes the image digest, not a tag. Copy the
-   command from the release notes:
+   command from the release notes (run it from `todo/berthy`):
 
    ```bash
    berthy deploy api -e prod --config $CFG --version sha256:<digest from the release notes>
@@ -199,19 +217,27 @@ the `berthy` CLI on your machine.
    `berthy ui` is the full-screen live view. The `cleanup` job shows in
    `berthy jobs`, and `berthy job run dump-db` dumps the database.
 
-7. **Open the app.** The API has no public address. It is on the Docker network
-   `todo` as `todo-api-web:8080`. To use it from a browser, either publish it
-   with Berthy's managed ingress (a Cloudflare Tunnel: uncomment `ingress` and
-   `hostnames` in `berthy/berthy.prod.yml` and follow step 7 of the guide), or
-   look at it through an SSH tunnel with a throwaway container on the server:
+7. **Open the app.** The API has no public address. On the `todo-dev` network
+   it answers as `api-web:8080` (Swarm service `todo-dev-api-web`). To use it
+   from a browser, either publish it with Berthy's managed ingress (a
+   Cloudflare Tunnel: uncomment `ingress` and `hostnames` in
+   `berthy/berthy.prod.yml` and follow step 7 of the guide), or look at it
+   through an SSH tunnel with a throwaway container on the server:
 
    ```bash
    ssh -L 8080:127.0.0.1:8080 ops@10.0.0.5
    # on the server:
-   docker run -d --name todo-peek --network todo -p 127.0.0.1:8080:8080 \
-     alpine/socat TCP-LISTEN:8080,fork,reachable TCP:todo-api-web:8080
+   docker run -d --name todo-peek --network todo-dev -p 127.0.0.1:8080:8080 \
+     alpine/socat TCP-LISTEN:8080,fork,reachable TCP:api-web:8080
    # then open http://localhost:8080 on your machine; when done:
    docker rm -f todo-peek
+   ```
+
+8. **Destroy.** Confirm with the hosted environment name. Stateful apps need
+   `--allow-recreate`:
+
+   ```bash
+   berthy destroy --project todo -e prod --confirm todo/prod --allow-recreate --dry-run
    ```
 
 The prod overlay leaves out what needs services of your own: backups to
