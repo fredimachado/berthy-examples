@@ -6,8 +6,7 @@ A small todo list you can run on your machine and deploy with
 describes: one project with three Berthy apps. Dev and prod can share one
 agent; each environment has its own overlay network (`todo-dev`, `todo-prod`).
 
-This needs a Berthy that supports projects: the next release, or a build from
-`main`. v0.2.0 does not.
+This needs Berthy v0.3.0 or later.
 
 | Berthy app | Kind | What it is |
 | --- | --- | --- |
