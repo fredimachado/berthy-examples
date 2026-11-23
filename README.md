@@ -19,9 +19,9 @@ Docker image.
   `latest` and `sha-<commit>`, tags the commit `v1.0.N` and creates a GitHub
   release with the image digest and the `berthy deploy` commands.
 
-The Berthy manifests are not validated in CI, because the Berthy repository is
-private and this repository cannot download its release. Validate them yourself
-with `berthy config validate -e dev --manifest-dir todo/berthy` (and `-e prod`).
+To validate the Todo manifests locally, install [Berthy v0.4.0 or later](https://github.com/fredimachado/berthy/releases)
+and run `berthy config validate -e dev --manifest-dir todo/berthy`, then repeat
+with `-e prod`.
 
 For the user guide, see the
 [Berthy repository](https://github.com/fredimachado/berthy/blob/main/docs/user-guide.md).
