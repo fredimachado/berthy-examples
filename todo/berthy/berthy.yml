@@ -18,6 +18,8 @@ apps:
   api:
     kind: image
     image: ghcr.io/fredimachado/todo-api
+    # `berthy deploy` without an app deploys the database and the cache first, then this app.
+    depends_on: [postgres, redis]
     roles:
       web:
         replicas: 1

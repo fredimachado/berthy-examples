@@ -183,7 +183,14 @@ the `berthy` CLI on your machine.
 
    Both print `manifest valid`.
 
-5. **Deploy Redis, then Postgres, then the API.** The API needs both.
+5. **Deploy the apps.** One command is enough; `depends_on` in `berthy.yml`
+   makes Berthy deploy postgres, then redis, then the api:
+
+   ```bash
+   berthy deploy -e dev --config $CFG --version v1.0.1
+   ```
+
+   Or one at a time:
 
    ```bash
    berthy deploy redis    -e dev --config $CFG
