@@ -3,10 +3,16 @@
 # This is the base manifest. berthy.dev.yml and berthy.prod.yml change it per environment.
 # The apps are described in ../README.md; the manifest keys are in the Berthy user guide.
 project: todo
+min_version: 0.4.0
 
-# The credential Berthy uses to pull todo-api from the private registry.
-# Store the token with: berthy secret set GHCR_TOKEN --registry ghcr.io -e ENV
-# (a GitHub token that can read packages; see ../README.md).
+# Berthy can generate these passwords before the apps first deploy.
+secrets:
+  POSTGRES_PASSWORD:
+    generate: {format: hex}
+  REDIS_PASSWORD:
+    generate: {format: hex}
+
+# Guided setup asks for the GitHub token that can read packages.
 registries:
   ghcr.io:
     username: fredimachado

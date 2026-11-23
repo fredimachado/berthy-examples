@@ -6,7 +6,7 @@ A small todo list you can run on your machine and deploy with
 describes: one project with three Berthy apps. Dev and prod can share one
 agent; each environment has its own overlay network (`todo-dev`, `todo-prod`).
 
-This needs Berthy v0.3.0 or later.
+This needs [Berthy v0.4.0](https://github.com/fredimachado/berthy/releases/tag/v0.4.0) or later.
 
 | Berthy app | Kind | What it is |
 | --- | --- | --- |
@@ -121,9 +121,9 @@ to it in GitHub's package list.
 ## Deploy it with Berthy
 
 The [Berthy user guide](https://github.com/fredimachado/berthy/blob/main/docs/user-guide.md)
-explains every step. This is the short path for this app. It uses the `dev`
-environment; for `prod`, change `-e dev` to `-e prod` and use
-`BERTHY_TODO_PROD_TOKEN`.
+explains every step. This is the short path for the `dev` environment.
+`BERTHY_ENV` sets the default for the commands below. Pass `-e prod` to
+target prod for one command.
 
 **You need** a Linux server with systemd, a private address on it (this README
 uses `10.0.0.5`), an account that is root or has `sudo` without a password, and
@@ -134,45 +134,30 @@ the `berthy` CLI on your machine.
    cannot read packages. Berthy uses it to pull the private image. Keep it out
    of your shell history.
 
-2. **Set up the server.** Work from the manifests' folder, so the manifest
-   supplies the project:
+2. **Set up the server.** Run setup in a terminal from the manifests' folder
+   so Berthy finds the project and can ask for secrets.
 
    ```bash
    cd todo/berthy
-   mkdir -p ~/.config/berthy
-   berthy setup -e dev --host ops@10.0.0.5 --listen 10.0.0.5:7710 \
-     --config ~/.config/berthy/config.json
-   export CFG=~/.config/berthy/config.json
-   export BERTHY_TODO_DEV_TOKEN=<the admin token setup printed>
+   export BERTHY_ENV=dev
+   berthy setup --host ops@10.0.0.5 --listen 10.0.0.5:7710
    ```
 
-   Save the admin token and the encryption key as the setup output says. The
-   key copy is named `todo.dev.key`. `berthy setup --dry-run` shows what it
-   would do first.
+   Add `--dry-run` to preview the setup. Berthy writes the CLI configuration and
+   saves the admin token in your local credential store. If setup cannot confirm
+   the save, keep the printed token privately and set `BERTHY_TODO_DEV_TOKEN` in
+   your shell. Save the encryption key as setup directs. Its copy is `todo.dev.key`.
 
-   To add prod on the same server, run setup again. It keeps the listen
-   address and creates a second hosted environment with its own network
-   (`todo-prod`):
+   To add prod on the same server, run `berthy setup -e prod --host ops@10.0.0.5`.
+   It keeps the listen address and creates the `todo-prod` environment. Its key
+   copy is `todo.prod.key`. The fallback token variable is `BERTHY_TODO_PROD_TOKEN`.
 
-   ```bash
-   berthy setup -e prod --host ops@10.0.0.5 --config $CFG
-   export BERTHY_TODO_PROD_TOKEN=<the admin token that run printed>
-   ```
-
-   That key copy is `todo.prod.key`.
-
-3. **Set the secrets.** Each value is read from standard input and is never
-   printed:
-
-   ```bash
-   read -rs GHCR_PAT         # paste the token from step 1, then Enter
-   printf '%s' "$GHCR_PAT" | berthy secret set GHCR_TOKEN --registry ghcr.io -e dev --config $CFG
-   unset GHCR_PAT
-   openssl rand -hex 24 | berthy secret set POSTGRES_PASSWORD -e dev --config $CFG
-   openssl rand -hex 24 | berthy secret set REDIS_PASSWORD    -e dev --config $CFG
-   ```
-
-   `GHCR_TOKEN` must carry `--registry ghcr.io`; the other two must not.
+3. **Finish setting the secrets.** On a fresh environment, setup generates the
+   Postgres and Redis passwords and asks for the GitHub token from step 1 at a
+   hidden prompt. To finish later, run `berthy secret set` in a terminal.
+   `berthy secret generate` generates only the declared passwords. Berthy keeps
+   stored passwords and generates a missing one only before an app that uses it
+   has been deployed. For an existing database or cache, enter its current password.
 
 4. **Check the manifests**, with no server needed:
 
@@ -187,15 +172,15 @@ the `berthy` CLI on your machine.
    makes Berthy deploy postgres, then redis, then the api:
 
    ```bash
-   berthy deploy -e dev --config $CFG --version v1.0.1
+   berthy deploy --version v1.0.1
    ```
 
    Or one at a time:
 
    ```bash
-   berthy deploy redis    -e dev --config $CFG
-   berthy deploy postgres -e dev --config $CFG
-   berthy deploy api      -e dev --config $CFG --version v1.0.1
+   berthy deploy redis
+   berthy deploy postgres
+   berthy deploy api --version v1.0.1
    ```
 
    Use the newest version from the [releases](https://github.com/fredimachado/berthy-examples/releases)
@@ -208,16 +193,16 @@ the `berthy` CLI on your machine.
    command from the release notes (run it from `todo/berthy`):
 
    ```bash
-   berthy deploy api -e prod --config $CFG --version sha256:<digest from the release notes>
+   berthy deploy api -e prod --version sha256:<digest from the release notes>
    ```
 
 6. **Look at it.**
 
    ```bash
-   berthy ps -e dev --config $CFG
-   berthy logs api -e dev --config $CFG --follow
-   berthy exec api -e dev --config $CFG -- /app/bin/migrate version
-   berthy ui -e dev --config $CFG
+   berthy ps
+   berthy logs api --follow
+   berthy exec api -- /app/bin/migrate version
+   berthy ui
    ```
 
    `berthy ui` is the full-screen live view. The `cleanup` job shows in
@@ -228,7 +213,11 @@ the `berthy` CLI on your machine.
    from a browser, either publish it with Berthy's managed ingress (a
    Cloudflare Tunnel: uncomment `ingress` and `hostnames` in
    `berthy/berthy.prod.yml` and follow step 7 of the guide), or look at it
-   through an SSH tunnel with a throwaway container on the server:
+   through an SSH tunnel with a throwaway container on the server. When the
+   selected manifest enables managed ingress, setup also asks for the
+   Cloudflare API token.
+
+   To use the SSH tunnel:
 
    ```bash
    ssh -L 8080:127.0.0.1:8080 ops@10.0.0.5
@@ -259,11 +248,11 @@ request. Every response also carries the name in the `X-Served-By` header, and
 `/version` reports it as `replica`. The name is the container's short id.
 
 To see the spread, scale the API to three replicas and ask for `/version` ten
-times. `https://todo.example.com` stands for your app's public address, and
-`$CFG` is set as in the deploy steps:
+times. Set `BERTHY_ENV=dev` as in the deploy steps and replace
+`https://todo.example.com` with your app's public address.
 
 ```bash
-berthy scale api -e dev --config $CFG --replicas 3 --role web
+berthy scale api --replicas 3 --role web
 for i in $(seq 10); do curl -s https://todo.example.com/version; echo; done
 ```
 
