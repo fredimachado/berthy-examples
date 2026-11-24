@@ -3,7 +3,9 @@ name: Release
 # Every push to main that passes the checks publishes a version, v1.0.<run number>:
 # the image ghcr.io/fredimachado/todo-api, a git tag on the built commit and a
 # GitHub release whose notes carry the image digest and the deploy commands.
-# Berthy's protected environments deploy by that digest.
+# On a protected environment the agent admits that digest; paste the digest
+# command in CI or other automation. At a terminal a human admin may resolve
+# a tag to one instead.
 #
 # The checks come from ci.yml, called as the first job: the tests run on the
 # commit that is published, and one file describes them. (The other way, a
@@ -133,7 +135,7 @@ jobs:
           berthy deploy api -e dev --version $VERSION
           \`\`\`
 
-          Prod is protected and takes only the digest:
+          Prod is protected. Paste this digest command in CI or any other automation:
 
           \`\`\`
           berthy deploy api -e prod --version $DIGEST

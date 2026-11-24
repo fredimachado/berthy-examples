@@ -1,5 +1,6 @@
-# The prod environment: protected (it deploys by image digest, never by tag),
-# two replicas and resource limits.
+# The prod environment: protected (the agent admits only an image digest; a
+# human admin may pick a tag in the CLI, which resolves it and submits the
+# digest), two replicas and resource limits.
 protected: true
 
 apps:

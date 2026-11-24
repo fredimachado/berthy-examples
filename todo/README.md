@@ -6,8 +6,9 @@ A small todo list you can run on your machine and deploy with
 describes: one project with three Berthy apps. Dev and prod can share one
 agent; each environment has its own overlay network (`todo-dev`, `todo-prod`).
 
-This walkthrough uses [Berthy v0.5.0](https://github.com/fredimachado/berthy/releases/tag/v0.5.0).
-The manifests work with v0.4.0 or later.
+This walkthrough uses [Berthy v0.6.0](https://github.com/fredimachado/berthy/releases/tag/v0.6.0).
+The manifests work with v0.4.0 or later. Automatic SSH recovery-key copy needs
+v0.5.0 or later.
 
 | Berthy app | Kind | What it is |
 | --- | --- | --- |
@@ -196,11 +197,34 @@ the `berthy` CLI on your machine.
    starts the new containers beside the old ones, waits for the health check,
    and then runs the `warm-cache` hook.
 
-   **Prod is protected**, so it takes the image digest, not a tag. Copy the
-   command from the release notes (run it from `todo/berthy`):
+   **Prod is protected.** The agent admits only a digest. At a terminal with a
+   human admin token and a clean committed checkout, list the tags, preview,
+   then confirm (default no):
+
+   ```bash
+   berthy versions api -e prod
+   berthy deploy api -e prod --version v1.0.1 --dry-run
+   berthy deploy api -e prod --version v1.0.1
+   ```
+
+   The CLI resolves the tag once, shows the full digest and plan, and asks
+   before admission. Commit any local changes to the manifests first; a dirty
+   checkout is refused.
+
+   In CI and scripts, give the digest yourself. Copy it from the release notes
+   (still from `todo/berthy`):
 
    ```bash
    berthy deploy api -e prod --version sha256:<digest from the release notes>
+   ```
+
+   That explicit digest command also works against a prod agent still on
+   v0.5.0. Tag listing and the interactive tag preview need a v0.6.0 agent.
+
+   When prod should run what already works in `dev`:
+
+   ```bash
+   berthy promote api --from dev -e prod
    ```
 
 6. **Look at it.**

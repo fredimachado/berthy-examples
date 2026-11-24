@@ -152,8 +152,7 @@ jobs:
           docker compose -f todo/berthy/deploy/redis.yml config --quiet
 
   # The Berthy manifests are checked with `berthy config validate`, which needs
-  # the berthy binary. It comes from the private repository fredimachado/berthy,
-  # which this repository's GITHUB_TOKEN cannot read, so that check is not run
+  # the berthy CLI. This workflow does not install it, so that check is not run
   # here. Run it on your machine before you push a manifest change:
   #   berthy config validate -e dev  --manifest-dir todo/berthy
   #   berthy config validate -e prod --manifest-dir todo/berthy
