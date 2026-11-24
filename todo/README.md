@@ -6,7 +6,8 @@ A small todo list you can run on your machine and deploy with
 describes: one project with three Berthy apps. Dev and prod can share one
 agent; each environment has its own overlay network (`todo-dev`, `todo-prod`).
 
-This needs [Berthy v0.4.0](https://github.com/fredimachado/berthy/releases/tag/v0.4.0) or later.
+This walkthrough uses [Berthy v0.5.0](https://github.com/fredimachado/berthy/releases/tag/v0.5.0).
+The manifests work with v0.4.0 or later.
 
 | Berthy app | Kind | What it is |
 | --- | --- | --- |
@@ -146,11 +147,17 @@ the `berthy` CLI on your machine.
    Add `--dry-run` to preview the setup. Berthy writes the CLI configuration and
    saves the admin token in your local credential store. If setup cannot confirm
    the save, keep the printed token privately and set `BERTHY_TODO_DEV_TOKEN` in
-   your shell. Save the encryption key as setup directs. Its copy is `todo.dev.key`.
+   your shell.
 
    To add prod on the same server, run `berthy setup -e prod --host ops@10.0.0.5`.
-   It keeps the listen address and creates the `todo-prod` environment. Its key
-   copy is `todo.prod.key`. The fallback token variable is `BERTHY_TODO_PROD_TOKEN`.
+   It keeps the listen address and creates the `todo-prod` environment. The
+   fallback token variable is `BERTHY_TODO_PROD_TOKEN`.
+
+   After each setup run, check `cli_key` for the saved file under `~/.berthy/keys`.
+   Setup names it `berthy.todo.dev.<key-id>.key` or `berthy.todo.prod.<key-id>.key`.
+   If `cli_key` says `not saved`, follow the first instruction under `next steps`.
+   With v0.4.0, run the key-copy command printed by setup.
+   See the [key backup instructions](https://github.com/fredimachado/berthy/blob/main/docs/user-guide.md#save-three-things).
 
 3. **Finish setting the secrets.** On a fresh environment, setup generates the
    Postgres and Redis passwords and asks for the GitHub token from step 1 at a
