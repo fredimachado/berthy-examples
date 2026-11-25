@@ -19,7 +19,7 @@ Docker image.
   `latest` and `sha-<commit>`, tags the commit `v1.0.N` and creates a GitHub
   release with the image digest and the `berthy deploy` commands.
 
-To validate the Todo manifests locally, install [Berthy v0.4.0 or later](https://github.com/fredimachado/berthy/releases)
+To validate the Todo manifests locally, install [Berthy v0.8.0 or later](https://github.com/fredimachado/berthy/releases)
 and run `berthy config validate -e dev --manifest-dir todo/berthy`, then repeat
 with `-e prod`.
 

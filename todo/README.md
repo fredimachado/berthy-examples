@@ -6,9 +6,8 @@ A small todo list you can run on your machine and deploy with
 describes: one project with three Berthy apps. Dev and prod can share one
 agent; each environment has its own overlay network (`todo-dev`, `todo-prod`).
 
-This walkthrough uses [Berthy v0.6.0](https://github.com/fredimachado/berthy/releases/tag/v0.6.0).
-The manifests work with v0.4.0 or later. Automatic SSH recovery-key copy needs
-v0.5.0 or later.
+This walkthrough uses [Berthy v0.8.0](https://github.com/fredimachado/berthy/releases/tag/v0.8.0).
+The manifests need v0.8.0 or later because they name the server.
 
 | Berthy app | Kind | What it is |
 | --- | --- | --- |
@@ -136,13 +135,15 @@ the `berthy` CLI on your machine.
    cannot read packages. Berthy uses it to pull the private image. Keep it out
    of your shell history.
 
-2. **Set up the server.** Run setup in a terminal from the manifests' folder
-   so Berthy finds the project and can ask for secrets.
+2. **Set up the server.** First edit `servers.web1` in `berthy.dev.yml` and
+   `berthy.prod.yml` to your server (both environments share one server in this
+   walkthrough). Then run setup from the manifests' folder so Berthy finds the
+   project and can ask for secrets.
 
    ```bash
    cd todo/berthy
    export BERTHY_ENV=dev
-   berthy setup --host ops@10.0.0.5 --listen 10.0.0.5:7710
+   berthy setup
    ```
 
    Add `--dry-run` to preview the setup. Berthy writes the CLI configuration and
@@ -150,14 +151,14 @@ the `berthy` CLI on your machine.
    the save, keep the printed token privately and set `BERTHY_TODO_DEV_TOKEN` in
    your shell.
 
-   To add prod on the same server, run `berthy setup -e prod --host ops@10.0.0.5`.
-   It keeps the listen address and creates the `todo-prod` environment. The
-   fallback token variable is `BERTHY_TODO_PROD_TOKEN`.
+   To add prod on the same server, run `berthy setup -e prod`. It creates the
+   `todo-prod` environment. The fallback token variable is
+   `BERTHY_TODO_PROD_TOKEN`. `--host USER@SERVER --listen ADDRESS:7710` still
+   works without a `servers` entry.
 
    After each setup run, check `cli_key` for the saved file under `~/.berthy/keys`.
    Setup names it `berthy.todo.dev.<key-id>.key` or `berthy.todo.prod.<key-id>.key`.
    If `cli_key` says `not saved`, follow the first instruction under `next steps`.
-   With v0.4.0, run the key-copy command printed by setup.
    See the [key backup instructions](https://github.com/fredimachado/berthy/blob/main/docs/user-guide.md#save-three-things).
 
 3. **Finish setting the secrets.** On a fresh environment, setup generates the

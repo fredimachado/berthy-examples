@@ -1,4 +1,10 @@
 # The dev environment: one replica, debug logs, no backups, no alerts.
+# Replace web1 with your own server.
+servers:
+  web1:
+    ssh: ops@10.0.0.5
+    address: 10.0.0.5
+
 apps:
   api:
     env:
