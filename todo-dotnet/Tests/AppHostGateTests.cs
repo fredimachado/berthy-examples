@@ -16,29 +16,30 @@ public sealed class AppHostGateTests
     public async Task ColdStartWaitsForDatabaseThenMigration()
     {
         using var cts = new CancellationTokenSource(Timeout);
-        await using var host = await AspireHost.StartAsync(AppHostPath, cts.Token);
 
-        // Capture first-seen resource states by polling describe — not when the test called wait.
-        var transitions = await host.WatchTransitionsAsync(
-            ["tododb", "migrate", "api"],
-            untilResource: "api",
-            untilStatePredicate: IsHealthyOrRunning,
-            cts.Token);
+        // Hold migrate at a test-controlled point: AppHost uses WithExplicitStart on migrate.
+        await using var host = await AspireHost.StartAsync(
+            AppHostPath,
+            cts.Token,
+            new Dictionary<string, string?> { ["HoldMigrateUntilStarted"] = "true" });
 
-        var dbReady = FirstTransition(transitions, "tododb", IsHealthyOrRunning);
-        var migrateDone = FirstTransition(
-            transitions,
-            "migrate",
-            state => IsFinished(state) || IsDown(state));
-        var apiReady = FirstTransition(transitions, "api", IsHealthyOrRunning);
+        await host.WaitAsync("tododb", "healthy", cts.Token);
+        await host.WaitAsync("redis", "healthy", cts.Token);
 
-        // Sequence index is the ordering proof; timestamps alone can tie within one poll tick.
+        // While migrate is held, WaitForCompletion must keep the API from serving.
+        await AssertApiDoesNotAcceptAsync(host, TimeSpan.FromSeconds(15), cts.Token);
+        var heldMigrate = await host.GetResourceAsync("migrate", cts.Token);
         Assert.True(
-            dbReady.Index < migrateDone.Index,
-            $"tododb ready (#{dbReady.Index} {dbReady.At:o} / {dbReady.State}) must precede migrate terminal (#{migrateDone.Index} {migrateDone.At:o} / {migrateDone.State})");
+            IsHeldBeforeStart(heldMigrate.State),
+            $"migrate should still be held before explicit start, was '{heldMigrate.State}'");
         Assert.True(
-            migrateDone.Index < apiReady.Index,
-            $"migrate terminal (#{migrateDone.Index} {migrateDone.At:o} / {migrateDone.State}) must precede api ready (#{apiReady.Index} {apiReady.At:o} / {apiReady.State})");
+            heldMigrate.ExitCode is null,
+            $"migrate must not have exited before release; exitCode={heldMigrate.ExitCode}");
+
+        // Release migration; require a successful exit before the API may serve.
+        await host.ResourceCommandAsync("migrate", "start", cts.Token);
+        var migrateExit = await host.WaitForExitCodeAsync("migrate", cts.Token);
+        Assert.Equal(0, migrateExit);
 
         await host.WaitAsync("api", "healthy", cts.Token);
 
@@ -56,25 +57,20 @@ public sealed class AppHostGateTests
     {
         using var cts = new CancellationTokenSource(Timeout);
 
-        // Real AppHost path: conflict resource WaitFor(database) then migrate WaitForCompletion(conflict).
+        // Real AppHost path: conflict → migrate WaitForCompletion(conflict) → api WaitForCompletion(migrate).
         await using var host = await AspireHost.StartAsync(
             AppHostPath,
             cts.Token,
             new Dictionary<string, string?> { ["PlantMigrationConflict"] = "true" });
 
-        await host.WaitUntilResourceAsync(
-            "conflict",
-            IsTerminalSuccess,
-            cts.Token);
+        var conflictExit = await host.WaitForExitCodeAsync("conflict", cts.Token);
+        Assert.Equal(0, conflictExit);
 
-        await host.WaitUntilResourceAsync(
-            "migrate",
-            state => IsFinished(state) || IsDown(state) || state.Contains("Failed", StringComparison.OrdinalIgnoreCase),
-            cts.Token);
+        // Initial migrate must reach a terminal nonzero exit — not NotStarted / never-launched.
+        var failedExit = await host.WaitForExitCodeAsync("migrate", cts.Token);
+        Assert.NotEqual(0, failedExit);
 
-        // Conflicting schema must prevent the CreateTodos baseline.
-        var historyBefore = await host.ExecSqlAsync(
-            "tododb",
+        var historyBefore = await host.ExecSqlOnOwnedPostgresAsync(
             """
             SELECT COUNT(*) FROM information_schema.tables
             WHERE table_schema = 'public' AND table_name = '__EFMigrationsHistory';
@@ -82,8 +78,7 @@ public sealed class AppHostGateTests
             cts.Token);
         if (long.TryParse(historyBefore.Trim(), out var historyTables) && historyTables > 0)
         {
-            var applied = await host.ExecSqlAsync(
-                "tododb",
+            var applied = await host.ExecSqlOnOwnedPostgresAsync(
                 """
                 SELECT COUNT(*) FROM "__EFMigrationsHistory"
                 WHERE "MigrationId" LIKE '%CreateTodos%';
@@ -96,21 +91,16 @@ public sealed class AppHostGateTests
             Assert.Equal("0", historyBefore.Trim());
         }
 
-        // WaitForCompletion(migrate) must keep the API from accepting requests.
-        await AssertApiDoesNotAcceptAsync(host, TimeSpan.FromSeconds(20), cts.Token);
+        await AssertApiDoesNotAcceptAsync(host, TimeSpan.FromSeconds(15), cts.Token);
 
-        // Same database: remove only the fixture conflict, remigrate, then start the gated API.
-        await host.ExecSqlAsync("tododb", "DROP TABLE IF EXISTS todos;", cts.Token);
+        // Same owned database: remove only the fixture conflict, remigrate with exit 0, then API serves [].
+        await host.ExecSqlOnOwnedPostgresAsync("DROP TABLE IF EXISTS todos;", cts.Token);
 
         await host.ResourceCommandAsync("migrate", "restart", cts.Token);
-        await host.WaitUntilResourceAsync(
-            "migrate",
-            state => IsTerminalSuccess(state) || IsDown(state) || IsFinished(state),
-            cts.Token);
+        var recoveredExit = await host.WaitForExitCodeAsync("migrate", cts.Token);
+        Assert.Equal(0, recoveredExit);
 
-        // Confirm CreateTodos applied on the same DB after repair.
-        var appliedAfter = await host.ExecSqlAsync(
-            "tododb",
+        var appliedAfter = await host.ExecSqlOnOwnedPostgresAsync(
             """
             SELECT COUNT(*) FROM "__EFMigrationsHistory"
             WHERE "MigrationId" LIKE '%CreateTodos%';
@@ -141,8 +131,8 @@ public sealed class AppHostGateTests
         {
             var api = await host.GetResourceAsync("api", cancellationToken);
             Assert.False(
-                IsHealthyOrRunning(api.State),
-                $"api became {api.State} while migrate was expected to block it via WaitForCompletion");
+                IsServing(api.State),
+                $"api became serving state '{api.State}' while migrate was expected to block it");
 
             if (api.TryGetHttpUrl(out var url))
             {
@@ -158,7 +148,7 @@ public sealed class AppHostGateTests
                 }
                 catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested)
                 {
-                    // Timeout on connect counts as not accepting.
+                    // Connect timeout counts as not accepting.
                 }
             }
 
@@ -173,51 +163,37 @@ public sealed class AppHostGateTests
         }
     }
 
-    private static ResourceTransition FirstTransition(
-        IReadOnlyList<ResourceTransition> transitions,
-        string resource,
-        Func<string, bool> predicate)
+    /// <summary>True only for healthy/running — never Unhealthy or NotStarted.</summary>
+    private static bool IsServing(string state)
     {
-        for (var i = 0; i < transitions.Count; i++)
+        if (state.Contains("Unhealthy", StringComparison.OrdinalIgnoreCase)
+            || state.Contains("NotStarted", StringComparison.OrdinalIgnoreCase)
+            || state.Contains("Waiting", StringComparison.OrdinalIgnoreCase)
+            || state.Contains("Finished", StringComparison.OrdinalIgnoreCase)
+            || state.Contains("Failed", StringComparison.OrdinalIgnoreCase))
         {
-            var t = transitions[i];
-            if (string.Equals(t.Resource, resource, StringComparison.OrdinalIgnoreCase)
-                && predicate(t.State))
-            {
-                return t with { Index = i };
-            }
+            return false;
         }
 
-        Assert.Fail(
-            $"no transition for {resource} matching predicate; saw: {string.Join(", ", transitions.Select(t => $"{t.Resource}={t.State}@{t.At:HH:mm:ss.fff}"))}");
-        return default;
+        var segments = state.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return segments.Any(s =>
+            string.Equals(s, "Healthy", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(s, "Running", StringComparison.OrdinalIgnoreCase));
     }
 
-    private static bool IsHealthyOrRunning(string state) =>
-        state.Contains("Healthy", StringComparison.OrdinalIgnoreCase)
-        || string.Equals(state, "Running", StringComparison.OrdinalIgnoreCase);
-
-    private static bool IsTerminalSuccess(string state) =>
-        string.Equals(state, "Finished", StringComparison.OrdinalIgnoreCase)
-        || string.Equals(state, "Exited", StringComparison.OrdinalIgnoreCase);
-
-    private static bool IsFinished(string state) =>
-        state.Contains("Finished", StringComparison.OrdinalIgnoreCase)
-        || state.Contains("Exited", StringComparison.OrdinalIgnoreCase);
-
-    private static bool IsDown(string state) =>
-        string.Equals(state, "Down", StringComparison.OrdinalIgnoreCase)
-        || string.Equals(state, "NotStarted", StringComparison.OrdinalIgnoreCase)
-        || string.Equals(state, "Finished", StringComparison.OrdinalIgnoreCase)
-        || string.Equals(state, "Exited", StringComparison.OrdinalIgnoreCase);
+    private static bool IsHeldBeforeStart(string state) =>
+        state.Contains("NotStarted", StringComparison.OrdinalIgnoreCase)
+        || state.Contains("Waiting", StringComparison.OrdinalIgnoreCase)
+        || string.IsNullOrWhiteSpace(state)
+        || state.Contains("Hidden", StringComparison.OrdinalIgnoreCase);
 }
-
-internal readonly record struct ResourceTransition(DateTimeOffset At, string Resource, string State, int Index = -1);
 
 internal sealed class ResourceSnapshot
 {
     public required string Name { get; init; }
+    public required string DisplayName { get; init; }
     public required string State { get; init; }
+    public int? ExitCode { get; init; }
     public required string Raw { get; init; }
     public JsonElement Root { get; init; }
 
@@ -253,12 +229,29 @@ internal sealed class ResourceSnapshot
 
         return false;
     }
+
+    public string? TryGetPropertyString(string propertyName)
+    {
+        if (!Root.TryGetProperty("properties", out var props) || props.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        if (props.TryGetProperty(propertyName, out var value) && value.ValueKind == JsonValueKind.String)
+        {
+            return value.GetString();
+        }
+
+        return null;
+    }
 }
 
 internal sealed class AspireHost : IAsyncDisposable
 {
     private readonly string _appHostPath;
     private readonly int _pid;
+    private string? _ownedPostgresContainerId;
+    private string? _ownedPostgresResourceName;
     private bool _stopped;
 
     private AspireHost(string appHostPath, int pid)
@@ -281,7 +274,7 @@ internal sealed class AspireHost : IAsyncDisposable
             throw new InvalidOperationException($"aspire start failed ({exit}): {stdout}\n{stderr}");
         }
 
-        using var doc = JsonDocument.Parse(stdout);
+        using var doc = JsonDocument.Parse(ExtractJsonObject(stdout));
         var pid = doc.RootElement.GetProperty("appHostPid").GetInt32();
         if (pid <= 0)
         {
@@ -296,55 +289,22 @@ internal sealed class AspireHost : IAsyncDisposable
             ["wait", resource, "--status", status, "--apphost", _appHostPath, "--non-interactive", "--nologo"],
             cancellationToken);
 
-    public async Task WaitUntilResourceAsync(
-        string resource,
-        Func<string, bool> predicate,
-        CancellationToken cancellationToken)
+    public async Task<int> WaitForExitCodeAsync(string resource, CancellationToken cancellationToken)
     {
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var snapshot = await GetResourceAsync(resource, cancellationToken);
-            if (predicate(snapshot.State))
+            if (snapshot.ExitCode is int code)
             {
-                return;
+                // Exit codes are only meaningful after the process has actually launched and finished.
+                Assert.False(
+                    IsNeverLaunched(snapshot.State),
+                    $"{resource} reported exitCode={code} while still never-launched ('{snapshot.State}')");
+                return code;
             }
 
             await Task.Delay(250, cancellationToken);
-        }
-    }
-
-    public async Task<List<ResourceTransition>> WatchTransitionsAsync(
-        IReadOnlyList<string> resources,
-        string untilResource,
-        Func<string, bool> untilStatePredicate,
-        CancellationToken cancellationToken)
-    {
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var transitions = new List<ResourceTransition>();
-
-        while (true)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var now = DateTimeOffset.UtcNow;
-
-            foreach (var resource in resources)
-            {
-                var snapshot = await GetResourceAsync(resource, cancellationToken);
-                var key = $"{resource}|{snapshot.State}";
-                if (seen.Add(key))
-                {
-                    transitions.Add(new ResourceTransition(now, resource, snapshot.State, transitions.Count));
-                }
-
-                if (string.Equals(resource, untilResource, StringComparison.OrdinalIgnoreCase)
-                    && untilStatePredicate(snapshot.State))
-                {
-                    return transitions;
-                }
-            }
-
-            await Task.Delay(200, cancellationToken);
         }
     }
 
@@ -360,8 +320,8 @@ internal sealed class AspireHost : IAsyncDisposable
             {
                 var name = r.TryGetProperty("name", out var n) ? n.GetString() : null;
                 var display = r.TryGetProperty("displayName", out var d) ? d.GetString() : null;
-                return string.Equals(name, resource, StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(display, resource, StringComparison.OrdinalIgnoreCase)
+                return string.Equals(display, resource, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(name, resource, StringComparison.OrdinalIgnoreCase)
                     || (name?.StartsWith(resource + "-", StringComparison.OrdinalIgnoreCase) ?? false);
             });
             if (element.ValueKind == JsonValueKind.Undefined)
@@ -370,15 +330,28 @@ internal sealed class AspireHost : IAsyncDisposable
             }
         }
 
-        var state = ReadState(element);
-        var name = element.TryGetProperty("name", out var nameEl)
-            ? nameEl.GetString() ?? resource
-            : resource;
+        int? exitCode = null;
+        if (element.TryGetProperty("exitCode", out var exitEl))
+        {
+            if (exitEl.ValueKind == JsonValueKind.Number && exitEl.TryGetInt32(out var n))
+            {
+                exitCode = n;
+            }
+            else if (exitEl.ValueKind == JsonValueKind.String
+                && int.TryParse(exitEl.GetString(), out var parsed))
+            {
+                exitCode = parsed;
+            }
+        }
 
         return new ResourceSnapshot
         {
-            Name = name,
-            State = state,
+            Name = element.TryGetProperty("name", out var nameEl) ? nameEl.GetString() ?? resource : resource,
+            DisplayName = element.TryGetProperty("displayName", out var displayEl)
+                ? displayEl.GetString() ?? resource
+                : resource,
+            State = ReadState(element),
+            ExitCode = exitCode,
             Raw = json,
             Root = element.Clone(),
         };
@@ -415,12 +388,13 @@ internal sealed class AspireHost : IAsyncDisposable
         return url;
     }
 
-    public async Task<string> ExecSqlAsync(string databaseResource, string sql, CancellationToken cancellationToken)
+    public async Task<string> ExecSqlOnOwnedPostgresAsync(string sql, CancellationToken cancellationToken)
     {
-        // Connection strings are redacted from describe; use the postgres container Aspire started.
-        var postgres = await GetResourceAsync("postgres", cancellationToken);
-        var containerId = await ResolvePostgresContainerIdAsync(postgres, cancellationToken);
+        var (containerId, resourceName) = await ResolveOwnedPostgresContainerAsync(cancellationToken);
         var (user, password) = await ReadPostgresCredentialsAsync(containerId, cancellationToken);
+
+        // Re-verify ownership immediately before destructive SQL.
+        await AssertContainerStillOwnedAsync(containerId, resourceName, cancellationToken);
 
         var start = new ProcessStartInfo
         {
@@ -438,7 +412,7 @@ internal sealed class AspireHost : IAsyncDisposable
         start.ArgumentList.Add("-U");
         start.ArgumentList.Add(user);
         start.ArgumentList.Add("-d");
-        start.ArgumentList.Add(databaseResource);
+        start.ArgumentList.Add("tododb");
         start.ArgumentList.Add("-t");
         start.ArgumentList.Add("-A");
         start.ArgumentList.Add("-c");
@@ -452,7 +426,7 @@ internal sealed class AspireHost : IAsyncDisposable
         if (process.ExitCode != 0)
         {
             throw new InvalidOperationException(
-                $"docker exec psql failed ({process.ExitCode}) on container {containerId}: {stderr}");
+                $"docker exec psql failed ({process.ExitCode}) on owned container {containerId} ({resourceName}): {stderr}");
         }
 
         return stdout;
@@ -476,91 +450,50 @@ internal sealed class AspireHost : IAsyncDisposable
         }
     }
 
-    private static string ReadState(JsonElement element)
-    {
-        if (element.TryGetProperty("healthStatus", out var health)
-            && health.ValueKind == JsonValueKind.String
-            && !string.IsNullOrWhiteSpace(health.GetString())
-            && !string.Equals(health.GetString(), "null", StringComparison.OrdinalIgnoreCase))
-        {
-            var healthText = health.GetString()!;
-            if (element.TryGetProperty("state", out var stateWithHealth)
-                && stateWithHealth.ValueKind == JsonValueKind.String)
-            {
-                return $"{stateWithHealth.GetString()}/{healthText}";
-            }
-
-            return healthText;
-        }
-
-        if (element.TryGetProperty("state", out var state))
-        {
-            if (state.ValueKind == JsonValueKind.String)
-            {
-                return state.GetString() ?? "";
-            }
-
-            if (state.ValueKind == JsonValueKind.Object
-                && state.TryGetProperty("text", out var text)
-                && text.ValueKind == JsonValueKind.String)
-            {
-                return text.GetString() ?? "";
-            }
-        }
-
-        return "";
-    }
-
-    private static async Task<string> ResolvePostgresContainerIdAsync(
-        ResourceSnapshot postgres,
+    private async Task<(string ContainerId, string ResourceName)> ResolveOwnedPostgresContainerAsync(
         CancellationToken cancellationToken)
     {
-        // Prefer an explicit container id from describe when Aspire exposes it.
-        if (postgres.Root.TryGetProperty("properties", out var props))
+        if (_ownedPostgresContainerId is not null && _ownedPostgresResourceName is not null)
         {
-            foreach (var prop in props.EnumerateObject())
-            {
-                if (prop.Name.Contains("container", StringComparison.OrdinalIgnoreCase)
-                    && prop.Value.ValueKind == JsonValueKind.String
-                    && !string.IsNullOrWhiteSpace(prop.Value.GetString()))
-                {
-                    return prop.Value.GetString()!;
-                }
-            }
+            return (_ownedPostgresContainerId, _ownedPostgresResourceName);
         }
 
-        var name = postgres.Name;
+        var postgres = await GetResourceAsync("postgres", cancellationToken);
+        var containerId = postgres.TryGetPropertyString("container.id");
+        if (string.IsNullOrWhiteSpace(containerId))
+        {
+            throw new InvalidOperationException(
+                $"AppHost postgres resource '{postgres.Name}' has no properties.container.id; refusing SQL. describe={postgres.Raw}");
+        }
+
+        // Ownership: container name must equal the exact Aspire resource name for this AppHost.
+        await AssertContainerStillOwnedAsync(containerId, postgres.Name, cancellationToken);
+        _ownedPostgresContainerId = containerId;
+        _ownedPostgresResourceName = postgres.Name;
+        return (containerId, postgres.Name);
+    }
+
+    private static async Task AssertContainerStillOwnedAsync(
+        string containerId,
+        string expectedResourceName,
+        CancellationToken cancellationToken)
+    {
         var (exit, stdout, stderr) = await RunProcessAsync(
             "docker",
-            ["ps", "--format", "{{.ID}} {{.Names}}"],
+            ["inspect", "-f", "{{.Name}}", containerId],
             cancellationToken);
         if (exit != 0)
         {
-            throw new InvalidOperationException($"docker ps failed ({exit}): {stderr}");
+            throw new InvalidOperationException(
+                $"Cannot verify ownership of container '{containerId}' for resource '{expectedResourceName}': {stderr}");
         }
 
-        foreach (var line in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        var containerName = stdout.Trim().TrimStart('/');
+        if (!string.Equals(containerName, expectedResourceName, StringComparison.Ordinal))
         {
-            var parts = line.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length == 2
-                && parts[1].Contains(name, StringComparison.OrdinalIgnoreCase))
-            {
-                return parts[0];
-            }
+            throw new InvalidOperationException(
+                $"Refusing SQL: container '{containerId}' is named '{containerName}', expected exact AppHost resource name '{expectedResourceName}'.");
         }
-
-        // Isolated AppHosts suffix resource names; match any running postgres:17 container started recently.
-        foreach (var line in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            var parts = line.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length == 2 && parts[1].Contains("postgres", StringComparison.OrdinalIgnoreCase))
-            {
-                return parts[0];
-            }
-        }
-
-        throw new InvalidOperationException(
-            $"Could not resolve postgres container for resource '{name}'. docker ps:\n{stdout}");
     }
 
     private static async Task<(string User, string Password)> ReadPostgresCredentialsAsync(
@@ -592,10 +525,60 @@ internal sealed class AspireHost : IAsyncDisposable
 
         if (string.IsNullOrWhiteSpace(user) || string.IsNullOrWhiteSpace(password))
         {
-            throw new InvalidOperationException($"POSTGRES_USER/PASSWORD missing in container {containerId}.");
+            throw new InvalidOperationException($"POSTGRES_USER/PASSWORD missing in owned container {containerId}.");
         }
 
         return (user, password);
+    }
+
+    private static string ReadState(JsonElement element)
+    {
+        string? stateText = null;
+        if (element.TryGetProperty("state", out var state))
+        {
+            if (state.ValueKind == JsonValueKind.String)
+            {
+                stateText = state.GetString();
+            }
+            else if (state.ValueKind == JsonValueKind.Object
+                && state.TryGetProperty("text", out var text)
+                && text.ValueKind == JsonValueKind.String)
+            {
+                stateText = text.GetString();
+            }
+        }
+
+        string? healthText = null;
+        if (element.TryGetProperty("healthStatus", out var health)
+            && health.ValueKind == JsonValueKind.String
+            && !string.IsNullOrWhiteSpace(health.GetString())
+            && !string.Equals(health.GetString(), "null", StringComparison.OrdinalIgnoreCase))
+        {
+            healthText = health.GetString();
+        }
+
+        if (stateText is not null && healthText is not null)
+        {
+            return $"{stateText}/{healthText}";
+        }
+
+        return stateText ?? healthText ?? "";
+    }
+
+    private static bool IsNeverLaunched(string state) =>
+        state.Contains("NotStarted", StringComparison.OrdinalIgnoreCase)
+        || string.IsNullOrWhiteSpace(state);
+
+    private static string ExtractJsonObject(string stdout)
+    {
+        var start = stdout.IndexOf('{');
+        var end = stdout.LastIndexOf('}');
+        if (start < 0 || end < start)
+        {
+            throw new InvalidOperationException($"No JSON object in aspire output: {stdout}");
+        }
+
+        return stdout[start..(end + 1)];
     }
 
     private async Task RunAspireCheckedAsync(string[] args, CancellationToken cancellationToken)
