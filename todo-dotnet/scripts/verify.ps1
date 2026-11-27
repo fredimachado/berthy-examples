@@ -6,6 +6,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $true
 Set-StrictMode -Version Latest
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot '..\..')
@@ -16,28 +17,15 @@ function Normalize-AppHostPath([string] $path) {
     return [System.IO.Path]::GetFullPath($path).TrimEnd('\', '/').ToLowerInvariant()
 }
 
-function Find-AppHostPid([string] $canonicalPath) {
-    $wanted = Normalize-AppHostPath $canonicalPath
-    $psJson = aspire ps --format Json --non-interactive --nologo | Out-String
-    $entries = @(if ([string]::IsNullOrWhiteSpace($psJson)) { @() } else { $psJson | ConvertFrom-Json })
-    $matches = @($entries | Where-Object {
-        $_.appHostPath -and (Normalize-AppHostPath ([string]$_.appHostPath)) -eq $wanted
-    })
-
-    if ($matches.Count -ne 1) {
-        throw "Expected exactly one AppHost for $canonicalPath, found $($matches.Count)."
+function Assert-NativeExit([string] $commandName) {
+    if ($LASTEXITCODE -ne 0) {
+        throw "$commandName exited with code $LASTEXITCODE."
     }
-
-    $pidValue = [int]$matches[0].appHostPid
-    if ($pidValue -le 0) {
-        throw "AppHost PID must be positive; got $pidValue."
-    }
-
-    return $pidValue
 }
 
 function Get-ApiHttpUrl([string] $apphost) {
     $describeJson = aspire describe api --format Json --apphost $apphost --non-interactive --nologo | Out-String
+    Assert-NativeExit 'aspire describe'
     $snapshot = $describeJson | ConvertFrom-Json
     $resources = @()
     if ($snapshot.resources) {
@@ -75,15 +63,30 @@ function Get-ApiHttpUrl([string] $apphost) {
 }
 
 $todoAppHostPid = $null
+$runError = $null
+$cleanupError = $null
 
 try {
     Write-Host "Starting AppHost: $todoAppHost"
-    aspire start --apphost $todoAppHost --isolated --non-interactive --format Json --nologo | Out-Host
+    $startJson = aspire start --apphost $todoAppHost --isolated --non-interactive --format Json --nologo | Out-String
+    Assert-NativeExit 'aspire start'
 
-    $todoAppHostPid = Find-AppHostPid $todoAppHost
+    $started = $startJson | ConvertFrom-Json
+    if (-not $started.appHostPath) {
+        throw "aspire start JSON missing appHostPath: $startJson"
+    }
+    if ((Normalize-AppHostPath ([string]$started.appHostPath)) -ne (Normalize-AppHostPath $todoAppHost)) {
+        throw "aspire start path '$($started.appHostPath)' does not match owned AppHost '$todoAppHost'."
+    }
+
+    $todoAppHostPid = [int]$started.appHostPid
+    if ($todoAppHostPid -le 0) {
+        throw "aspire start returned non-positive appHostPid: $($started.appHostPid)"
+    }
     Write-Host "Owned AppHost PID: $todoAppHostPid"
 
     aspire wait api --status healthy --apphost $todoAppHost --non-interactive --nologo | Out-Host
+    Assert-NativeExit 'aspire wait'
 
     $apiUrl = Get-ApiHttpUrl $todoAppHost
     Write-Host "API http endpoint: $apiUrl"
@@ -92,21 +95,29 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "smoke.ps1 failed with exit code $LASTEXITCODE"
     }
-
-    Write-Host "verify.ps1 -Target $Target succeeded"
+}
+catch {
+    $runError = $_
 }
 finally {
-    if ($null -eq $todoAppHostPid) {
+    if ($null -ne $todoAppHostPid) {
         try {
-            $todoAppHostPid = Find-AppHostPid $todoAppHost
+            Write-Host "Stopping AppHost PID $todoAppHostPid"
+            aspire stop --pid $todoAppHostPid --apphost $todoAppHost --non-interactive --nologo | Out-Host
+            Assert-NativeExit 'aspire stop'
         }
         catch {
-            Write-Warning "Could not recover AppHost PID for cleanup: $_"
+            $cleanupError = $_
         }
     }
-
-    if ($null -ne $todoAppHostPid) {
-        Write-Host "Stopping AppHost PID $todoAppHostPid"
-        aspire stop --pid $todoAppHostPid --apphost $todoAppHost --non-interactive --nologo | Out-Host
-    }
 }
+
+if ($null -ne $cleanupError) {
+    throw "AppHost cleanup failed: $cleanupError"
+}
+
+if ($null -ne $runError) {
+    throw $runError
+}
+
+Write-Host "verify.ps1 -Target $Target succeeded"

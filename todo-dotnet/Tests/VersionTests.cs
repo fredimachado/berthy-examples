@@ -36,6 +36,8 @@ public sealed class VersionTests
         await using var factory = new ApiFactory(
             new Dictionary<string, string?>
             {
+                ["BuildVersion"] = "",
+                ["BuildCommit"] = "",
                 ["HOSTNAME"] = "",
             });
         var client = factory.CreateClient();
@@ -71,6 +73,8 @@ public sealed class VersionTests
         await using var withoutReplica = new ApiFactory(
             new Dictionary<string, string?>
             {
+                ["BuildVersion"] = "",
+                ["BuildCommit"] = "",
                 ["HOSTNAME"] = "",
             });
         using (var response = await withoutReplica.CreateClient().GetAsync("/nope"))
