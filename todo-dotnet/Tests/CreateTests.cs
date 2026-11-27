@@ -115,6 +115,8 @@ public sealed class CreateTests
             ("wrong type", """{"title":5}""", HttpStatusCode.BadRequest, null),
             ("unknown field", """{"title":"x","id":9}""", HttpStatusCode.BadRequest,
                 "invalid JSON: json: unknown field \"id\""),
+            ("unknown field apostrophe", "{\"title\":\"x\",\"owner's\":1}", HttpStatusCode.BadRequest,
+                "invalid JSON: json: unknown field \"owner's\""),
             ("trailing object", """{"title":"x"} {}""", HttpStatusCode.BadRequest,
                 "invalid JSON: unexpected data after the JSON object"),
             ("empty object", "{}", HttpStatusCode.UnprocessableEntity,
@@ -213,6 +215,21 @@ public sealed class CreateTests
         var client = factory.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
 
         using var response = await PostJsonAsync(client, """{"title":"slash"}""", path: "/api/todos/");
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        await AssertExactJsonErrorAsync(response, "not found");
+        Assert.Equal(0, await CountTodosAsync(database.ConnectionString));
+    }
+
+    [Fact]
+    public async Task UppercasePathPostDoesNotCreate()
+    {
+        await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
+        Assert.Equal(0, (await MigrateProcess.RunAsync(database.ConnectionString)).ExitCode);
+
+        await using var factory = CreateFactory(database.ConnectionString, replica: "");
+        var client = factory.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
+
+        using var response = await PostJsonAsync(client, """{"title":"upper-path"}""", path: "/API/TODOS");
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
         await AssertExactJsonErrorAsync(response, "not found");
         Assert.Equal(0, await CountTodosAsync(database.ConnectionString));

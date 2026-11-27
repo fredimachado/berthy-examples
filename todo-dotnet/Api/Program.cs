@@ -49,11 +49,27 @@ if (build.Replica is { Length: > 0 } replica)
     });
 }
 
-// Endpoint routing collapses /api/todos and /api/todos/; Go's mux does not.
+// Go's ServeMux is case-sensitive and does not treat /api/todos/ as /api/todos.
 app.Use(async (context, next) =>
 {
     var path = context.Request.Path.Value;
     if (path is { Length: > 1 } && path.EndsWith('/'))
+    {
+        await JsonError.Write(StatusCodes.Status404NotFound, "not found").ExecuteAsync(context);
+        return;
+    }
+
+    if (path is not null
+        && path.Equals("/api/todos", StringComparison.OrdinalIgnoreCase)
+        && !string.Equals(path, "/api/todos", StringComparison.Ordinal))
+    {
+        await JsonError.Write(StatusCodes.Status404NotFound, "not found").ExecuteAsync(context);
+        return;
+    }
+
+    if (path is not null
+        && path.Equals("/version", StringComparison.OrdinalIgnoreCase)
+        && !string.Equals(path, "/version", StringComparison.Ordinal))
     {
         await JsonError.Write(StatusCodes.Status404NotFound, "not found").ExecuteAsync(context);
         return;

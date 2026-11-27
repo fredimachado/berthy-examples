@@ -1,21 +1,8 @@
 using System.Text.Json;
-using System.Text.Json.Serialization;
-using System.Text.RegularExpressions;
 
 internal static class TodoRequestBody
 {
     internal const int MaxBodyBytes = 8192;
-
-    private static readonly JsonSerializerOptions StrictOptions = new()
-    {
-        // Go's encoding/json matches field names case-insensitively.
-        PropertyNameCaseInsensitive = true,
-        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
-    };
-
-    private static readonly Regex UnmappedPropertyName = new(
-        "['\"](?<name>[^'\"]+)['\"] could not be mapped|JSON property '(?<name>[^']+)'",
-        RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     /// <summary>
     /// Reads at most <see cref="MaxBodyBytes"/> + 1 bytes (even without Content-Length).
@@ -64,13 +51,13 @@ internal static class TodoRequestBody
             }
             else if (reader.TokenType == JsonTokenType.StartObject)
             {
-                var parsed = JsonSerializer.Deserialize<CreateTodoBody>(ref reader, StrictOptions);
-                if (parsed is null)
+                var (parsed, error) = ReadCreateObject(ref reader);
+                if (error is not null)
                 {
-                    return (null, JsonError.Write(StatusCodes.Status400BadRequest, "invalid JSON: expected an object"));
+                    return (null, error);
                 }
 
-                body = parsed;
+                body = parsed!;
             }
             else
             {
@@ -98,58 +85,71 @@ internal static class TodoRequestBody
 
             return (body, null);
         }
-        catch (JsonException ex)
+        catch (JsonException)
         {
             return (null, JsonError.Write(
                 StatusCodes.Status400BadRequest,
-                "invalid JSON: " + JsonProblem(ex)));
+                "invalid JSON: syntax error"));
         }
     }
 
-    private static string JsonProblem(JsonException ex)
+    /// <summary>
+    /// Walks object tokens so unknown field names come from the JSON property token
+    /// (including names with apostrophes), matching Go's DisallowUnknownFields.
+    /// Title matching is case-insensitive like encoding/json.
+    /// </summary>
+    private static (CreateTodoBody? Body, IResult? Error) ReadCreateObject(ref Utf8JsonReader reader)
     {
-        if (IsUnmappedMember(ex))
-        {
-            var name = ExtractUnmappedName(ex) ?? "unknown";
-            return $"json: unknown field \"{name}\"";
-        }
+        string? title = null;
 
-        if (ex.Path is { Length: > 0 }
-            && (ex.Message.Contains("could not be converted", StringComparison.OrdinalIgnoreCase)
-                || ex.Message.Contains("wrong type", StringComparison.OrdinalIgnoreCase)
-                || ex.Message.Contains("Boolean", StringComparison.OrdinalIgnoreCase)
-                || ex.Message.Contains("Number", StringComparison.OrdinalIgnoreCase)))
+        while (reader.Read())
         {
-            var field = ex.Path.TrimStart('$', '.');
-            if (field.Length > 0)
+            if (reader.TokenType == JsonTokenType.EndObject)
             {
-                return $"field \"{field}\" has the wrong type";
+                return (new CreateTodoBody(title), null);
+            }
+
+            if (reader.TokenType != JsonTokenType.PropertyName)
+            {
+                return (null, JsonError.Write(
+                    StatusCodes.Status400BadRequest,
+                    "invalid JSON: syntax error"));
+            }
+
+            // Exact wire name from the token — do not parse exception text.
+            var fieldName = reader.GetString() ?? "";
+
+            if (!reader.Read())
+            {
+                return (null, JsonError.Write(
+                    StatusCodes.Status400BadRequest,
+                    "invalid JSON: syntax error"));
+            }
+
+            if (!fieldName.Equals("title", StringComparison.OrdinalIgnoreCase))
+            {
+                return (null, JsonError.Write(
+                    StatusCodes.Status400BadRequest,
+                    $"invalid JSON: json: unknown field \"{fieldName}\""));
+            }
+
+            switch (reader.TokenType)
+            {
+                case JsonTokenType.Null:
+                    title = null;
+                    break;
+                case JsonTokenType.String:
+                    title = reader.GetString();
+                    break;
+                default:
+                    return (null, JsonError.Write(
+                        StatusCodes.Status400BadRequest,
+                        "invalid JSON: field \"title\" has the wrong type"));
             }
         }
 
-        return "syntax error";
-    }
-
-    private static bool IsUnmappedMember(JsonException ex) =>
-        ex.Message.Contains("not been mapped", StringComparison.OrdinalIgnoreCase)
-        || ex.Message.Contains("could not be mapped", StringComparison.OrdinalIgnoreCase)
-        || ex.Message.Contains("Unmapped member", StringComparison.OrdinalIgnoreCase)
-        || ex.Message.Contains("extensible", StringComparison.OrdinalIgnoreCase)
-        || ex.Message.Contains("cannot be mapped", StringComparison.OrdinalIgnoreCase);
-
-    private static string? ExtractUnmappedName(JsonException ex)
-    {
-        var match = UnmappedPropertyName.Match(ex.Message);
-        if (match.Success)
-        {
-            return match.Groups["name"].Value;
-        }
-
-        if (ex.Path is { Length: > 0 })
-        {
-            return ex.Path.TrimStart('$', '.');
-        }
-
-        return null;
+        return (null, JsonError.Write(
+            StatusCodes.Status400BadRequest,
+            "invalid JSON: syntax error"));
     }
 }
