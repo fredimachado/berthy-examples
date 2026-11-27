@@ -91,6 +91,10 @@ test("EmptyListMessageOnlyAfterSuccessfulEmptyGet", async ({ page }) => {
   const hold = new Promise<void>((resolve) => {
     releaseHold = resolve;
   });
+  let signalHeld!: () => void;
+  const held = new Promise<void>((resolve) => {
+    signalHeld = resolve;
+  });
 
   await page.route(/\/api\/todos\/?$/, async (route) => {
     if (route.request().method() !== "GET") {
@@ -98,6 +102,7 @@ test("EmptyListMessageOnlyAfterSuccessfulEmptyGet", async ({ page }) => {
       return;
     }
     if (outcome === "hold") {
+      signalHeld();
       await hold;
     }
     if (outcome === "fail") {
@@ -126,6 +131,8 @@ test("EmptyListMessageOnlyAfterSuccessfulEmptyGet", async ({ page }) => {
 
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Todo" })).toBeVisible();
+  // Wait until the list GET is actually held in the route handler before asserting.
+  await held;
   await expect(page.locator("#list .empty")).toHaveCount(0);
 
   outcome = "fail";
