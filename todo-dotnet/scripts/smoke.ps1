@@ -130,4 +130,64 @@ if ($finalCount -ne ($beforeCount + 1)) {
     throw "after POST null expected $($beforeCount + 1) rows, got $finalCount"
 }
 
-Write-Host "smoke ok: version=$($payload.version) commit=$($payload.commit) createdId=$createdId todos=$listFinalContent"
+$todoUrl = "$todosUrl/$createdId"
+
+$renameResponse = Invoke-WebRequest -Uri $todoUrl -Method PATCH -Body '{"title":"buy oat milk"}' -ContentType 'application/json'
+if ($renameResponse.StatusCode -ne 200) {
+    throw "PATCH rename returned $($renameResponse.StatusCode): $($renameResponse.Content)"
+}
+$renamed = $renameResponse.Content | ConvertFrom-Json
+if ([string]$renamed.title -ne 'buy oat milk') {
+    throw "PATCH rename title='$($renamed.title)', want 'buy oat milk'"
+}
+if ($renamed.done -ne $false) {
+    throw "PATCH rename expected done=false"
+}
+
+$checkResponse = Invoke-WebRequest -Uri $todoUrl -Method PATCH -Body '{"done":true}' -ContentType 'application/json'
+if ($checkResponse.StatusCode -ne 200) {
+    throw "PATCH check returned $($checkResponse.StatusCode): $($checkResponse.Content)"
+}
+$checked = $checkResponse.Content | ConvertFrom-Json
+if ($checked.done -ne $true -or [string]$checked.title -ne 'buy oat milk') {
+    throw "PATCH check body=$($checkResponse.Content)"
+}
+
+$uncheckResponse = Invoke-WebRequest -Uri $todoUrl -Method PATCH -Body '{"done":false}' -ContentType 'application/json'
+if ($uncheckResponse.StatusCode -ne 200) {
+    throw "PATCH uncheck returned $($uncheckResponse.StatusCode): $($uncheckResponse.Content)"
+}
+$unchecked = $uncheckResponse.Content | ConvertFrom-Json
+if ($unchecked.done -ne $false) {
+    throw "PATCH uncheck expected done=false: $($uncheckResponse.Content)"
+}
+
+$deleteResponse = Invoke-WebRequest -Uri $todoUrl -Method DELETE
+if ($deleteResponse.StatusCode -ne 204) {
+    throw "DELETE returned $($deleteResponse.StatusCode)"
+}
+if (-not [string]::IsNullOrEmpty([string]$deleteResponse.Content)) {
+    throw "DELETE 204 must have an empty body, got: $($deleteResponse.Content)"
+}
+
+$deleteAgain = Invoke-WebRequest -Uri $todoUrl -Method DELETE -SkipHttpErrorCheck
+if ([int]$deleteAgain.StatusCode -ne 404) {
+    throw "DELETE missing status=$([int]$deleteAgain.StatusCode), want 404"
+}
+
+$listAfterDelete = Invoke-WebRequest -Uri $todosUrl -Method GET
+$listAfterDeleteContent = [string]$listAfterDelete.Content
+$listAfterDeleteJson = $listAfterDeleteContent | ConvertFrom-Json -NoEnumerate
+if ($listAfterDeleteJson -isnot [System.Array]) {
+    throw "GET /api/todos after delete expected a JSON array: $listAfterDeleteContent"
+}
+if ($listAfterDeleteJson.Length -ne $beforeCount) {
+    throw "after DELETE expected $beforeCount rows, got $($listAfterDeleteJson.Length)"
+}
+foreach ($item in $listAfterDeleteJson) {
+    if ([long]$item.id -eq $createdId) {
+        throw "deleted id $createdId still listed"
+    }
+}
+
+Write-Host "smoke ok: version=$($payload.version) commit=$($payload.commit) createdId=$createdId renamed/checked/deleted todos=$listAfterDeleteContent"

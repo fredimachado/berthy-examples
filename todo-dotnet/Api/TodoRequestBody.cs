@@ -15,27 +15,10 @@ internal static class TodoRequestBody
         HttpRequest request,
         CancellationToken ct)
     {
-        var buffer = new byte[MaxBodyBytes + 1];
-        var total = 0;
-        while (total < buffer.Length)
+        var (buffer, total, error) = await ReadBodyBytesAsync(request, ct);
+        if (error is not null)
         {
-            var read = await request.Body.ReadAsync(buffer.AsMemory(total, buffer.Length - total), ct);
-            if (read == 0)
-            {
-                break;
-            }
-
-            total += read;
-        }
-
-        if (total > MaxBodyBytes)
-        {
-            return (null, JsonError.Write(StatusCodes.Status413RequestEntityTooLarge, "request body too large"));
-        }
-
-        if (total == 0)
-        {
-            return (null, JsonError.Write(StatusCodes.Status400BadRequest, "invalid JSON: the body is empty"));
+            return (null, error);
         }
 
         try
@@ -53,10 +36,10 @@ internal static class TodoRequestBody
             }
             else if (reader.TokenType == JsonTokenType.StartObject)
             {
-                var (parsed, error) = ReadCreateObject(ref reader);
-                if (error is not null)
+                var (parsed, parseError) = ReadCreateObject(ref reader);
+                if (parseError is not null)
                 {
-                    return (null, error);
+                    return (null, parseError);
                 }
 
                 body = parsed!;
@@ -68,24 +51,7 @@ internal static class TodoRequestBody
                     "invalid JSON: expected an object or null"));
             }
 
-            try
-            {
-                if (reader.Read())
-                {
-                    return (null, JsonError.Write(
-                        StatusCodes.Status400BadRequest,
-                        "invalid JSON: unexpected data after the JSON object"));
-                }
-            }
-            catch (JsonException)
-            {
-                // Trailing junk that fails to tokenize still matches Go's trailing-data rejection.
-                return (null, JsonError.Write(
-                    StatusCodes.Status400BadRequest,
-                    "invalid JSON: unexpected data after the JSON object"));
-            }
-
-            return (body, null);
+            return FinishObjectOrNull(ref reader, body);
         }
         catch (JsonException)
         {
@@ -93,6 +59,116 @@ internal static class TodoRequestBody
                 StatusCodes.Status400BadRequest,
                 "invalid JSON: syntax error"));
         }
+    }
+
+    /// <summary>
+    /// Same body rules as create. Omitted or JSON-null members stay null (leave field alone).
+    /// </summary>
+    internal static async Task<(PatchTodoBody? Body, IResult? Error)> ReadPatchAsync(
+        HttpRequest request,
+        CancellationToken ct)
+    {
+        var (buffer, total, error) = await ReadBodyBytesAsync(request, ct);
+        if (error is not null)
+        {
+            return (null, error);
+        }
+
+        try
+        {
+            var reader = new Utf8JsonReader(buffer.AsSpan(0, total));
+            if (!reader.Read())
+            {
+                return (null, JsonError.Write(StatusCodes.Status400BadRequest, "invalid JSON: the body is empty"));
+            }
+
+            PatchTodoBody body;
+            if (reader.TokenType == JsonTokenType.Null)
+            {
+                body = new PatchTodoBody(null, null);
+            }
+            else if (reader.TokenType == JsonTokenType.StartObject)
+            {
+                var (parsed, parseError) = ReadPatchObject(ref reader);
+                if (parseError is not null)
+                {
+                    return (null, parseError);
+                }
+
+                body = parsed!;
+            }
+            else
+            {
+                return (null, JsonError.Write(
+                    StatusCodes.Status400BadRequest,
+                    "invalid JSON: expected an object or null"));
+            }
+
+            return FinishObjectOrNull(ref reader, body);
+        }
+        catch (JsonException)
+        {
+            return (null, JsonError.Write(
+                StatusCodes.Status400BadRequest,
+                "invalid JSON: syntax error"));
+        }
+    }
+
+    private static async Task<(byte[] Buffer, int Total, IResult? Error)> ReadBodyBytesAsync(
+        HttpRequest request,
+        CancellationToken ct)
+    {
+        var buffer = new byte[MaxBodyBytes + 1];
+        var total = 0;
+        while (total < buffer.Length)
+        {
+            var read = await request.Body.ReadAsync(buffer.AsMemory(total, buffer.Length - total), ct);
+            if (read == 0)
+            {
+                break;
+            }
+
+            total += read;
+        }
+
+        if (total > MaxBodyBytes)
+        {
+            return (buffer, total, JsonError.Write(
+                StatusCodes.Status413RequestEntityTooLarge,
+                "request body too large"));
+        }
+
+        if (total == 0)
+        {
+            return (buffer, total, JsonError.Write(
+                StatusCodes.Status400BadRequest,
+                "invalid JSON: the body is empty"));
+        }
+
+        return (buffer, total, null);
+    }
+
+    private static (T? Body, IResult? Error) FinishObjectOrNull<T>(ref Utf8JsonReader reader, T body)
+        where T : class
+    {
+        try
+        {
+            if (reader.Read())
+            {
+                return (null, JsonError.Write(
+                    StatusCodes.Status400BadRequest,
+                    "invalid JSON: unexpected data after the JSON object"));
+            }
+        }
+        catch (JsonException)
+        {
+            // Trailing junk that fails to tokenize still matches Go's trailing-data rejection.
+            return (null, JsonError.Write(
+                StatusCodes.Status400BadRequest,
+                "invalid JSON: unexpected data after the JSON object"));
+        }
+
+        return (body, null);
     }
 
     /// <summary>
@@ -148,6 +224,86 @@ internal static class TodoRequestBody
                         StatusCodes.Status400BadRequest,
                         "invalid JSON: field \"title\" has the wrong type"));
             }
+        }
+
+        return (null, JsonError.Write(
+            StatusCodes.Status400BadRequest,
+            "invalid JSON: syntax error"));
+    }
+
+    private static (PatchTodoBody? Body, IResult? Error) ReadPatchObject(ref Utf8JsonReader reader)
+    {
+        string? title = null;
+        bool? done = null;
+
+        while (reader.Read())
+        {
+            if (reader.TokenType == JsonTokenType.EndObject)
+            {
+                return (new PatchTodoBody(title, done), null);
+            }
+
+            if (reader.TokenType != JsonTokenType.PropertyName)
+            {
+                return (null, JsonError.Write(
+                    StatusCodes.Status400BadRequest,
+                    "invalid JSON: syntax error"));
+            }
+
+            var fieldName = ReadJsonStringLikeGo(ref reader);
+
+            if (!reader.Read())
+            {
+                return (null, JsonError.Write(
+                    StatusCodes.Status400BadRequest,
+                    "invalid JSON: syntax error"));
+            }
+
+            if (fieldName.Equals("title", StringComparison.OrdinalIgnoreCase))
+            {
+                switch (reader.TokenType)
+                {
+                    case JsonTokenType.Null:
+                        // JSON null into *string → leave field alone (nil).
+                        title = null;
+                        break;
+                    case JsonTokenType.String:
+                        title = ReadJsonStringLikeGo(ref reader);
+                        break;
+                    default:
+                        return (null, JsonError.Write(
+                            StatusCodes.Status400BadRequest,
+                            "invalid JSON: field \"title\" has the wrong type"));
+                }
+
+                continue;
+            }
+
+            if (fieldName.Equals("done", StringComparison.OrdinalIgnoreCase))
+            {
+                switch (reader.TokenType)
+                {
+                    case JsonTokenType.Null:
+                        done = null;
+                        break;
+                    case JsonTokenType.True:
+                        done = true;
+                        break;
+                    case JsonTokenType.False:
+                        done = false;
+                        break;
+                    default:
+                        return (null, JsonError.Write(
+                            StatusCodes.Status400BadRequest,
+                            "invalid JSON: field \"done\" has the wrong type"));
+                }
+
+                continue;
+            }
+
+            return (null, JsonError.Write(
+                StatusCodes.Status400BadRequest,
+                "invalid JSON: json: unknown field " + GoQuote(fieldName)));
         }
 
         return (null, JsonError.Write(

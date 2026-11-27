@@ -1,5 +1,7 @@
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.EntityFrameworkCore;
 
 internal static class TodoCommands
 {
@@ -48,5 +50,133 @@ internal static class TodoCommands
             logger?.LogError(ex, "request failed {Method} {Path}", request.Method, request.Path);
             return JsonError.Write(StatusCodes.Status500InternalServerError, "internal error");
         }
+    }
+
+    internal static async Task<IResult> PatchTodoAsync(
+        string id,
+        HttpRequest request,
+        TodoDbContext db,
+        CancellationToken ct)
+    {
+        if (!TryParsePositiveId(id, out var todoId))
+        {
+            return JsonError.Write(StatusCodes.Status400BadRequest, "id must be a positive number");
+        }
+
+        var (body, error) = await TodoRequestBody.ReadPatchAsync(request, ct);
+        if (error is not null)
+        {
+            return error;
+        }
+
+        if (body!.Title is null && body.Done is null)
+        {
+            return JsonError.Write(
+                StatusCodes.Status422UnprocessableEntity,
+                "give a title, done or both");
+        }
+
+        string? cleanTitle = null;
+        if (body.Title is not null)
+        {
+            if (!TodoTitle.TryParse(body.Title, out var title))
+            {
+                return JsonError.Write(
+                    StatusCodes.Status422UnprocessableEntity,
+                    "title must be 1 to 200 characters");
+            }
+
+            cleanTitle = title!.Value;
+        }
+
+        try
+        {
+            await using var tx = await db.Database.BeginTransactionAsync(ct);
+
+            // Lock the row before reading values used for the change (lost-update protection).
+            var locked = await db.Todos
+                .FromSql($"SELECT id, title, done, created_at, updated_at FROM todos WHERE id = {todoId} FOR UPDATE")
+                .AsTracking()
+                .SingleOrDefaultAsync(ct);
+
+            if (locked is null)
+            {
+                await tx.RollbackAsync(ct);
+                return JsonError.Write(StatusCodes.Status404NotFound, "todo not found");
+            }
+
+            if (cleanTitle is not null)
+            {
+                locked.Title = cleanTitle;
+            }
+
+            if (body.Done is { } done)
+            {
+                locked.Done = done;
+            }
+
+            // timestamptz is microsecond-precision; match so response equals a fresh SELECT.
+            locked.UpdatedAt = TruncateToMicroseconds(DateTimeOffset.UtcNow);
+            await db.SaveChangesAsync(ct);
+            await tx.CommitAsync(ct);
+
+            var response = new TodoResponse(
+                locked.Id,
+                locked.Title,
+                locked.Done,
+                locked.CreatedAt,
+                locked.UpdatedAt);
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(response, ResponseOptions);
+            return new RawJsonResult(StatusCodes.Status200OK, bytes);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            var logger = request.HttpContext.RequestServices
+                .GetService<ILoggerFactory>()
+                ?.CreateLogger("Todo.Patch");
+            logger?.LogError(ex, "request failed {Method} {Path}", request.Method, request.Path);
+            return JsonError.Write(StatusCodes.Status500InternalServerError, "internal error");
+        }
+    }
+
+    internal static async Task<IResult> DeleteTodoAsync(
+        string id,
+        HttpRequest request,
+        TodoDbContext db,
+        CancellationToken ct)
+    {
+        if (!TryParsePositiveId(id, out var todoId))
+        {
+            return JsonError.Write(StatusCodes.Status400BadRequest, "id must be a positive number");
+        }
+
+        try
+        {
+            var affected = await db.Todos.Where(t => t.Id == todoId).ExecuteDeleteAsync(ct);
+            if (affected == 0)
+            {
+                return JsonError.Write(StatusCodes.Status404NotFound, "todo not found");
+            }
+
+            return Results.NoContent();
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            var logger = request.HttpContext.RequestServices
+                .GetService<ILoggerFactory>()
+                ?.CreateLogger("Todo.Delete");
+            logger?.LogError(ex, "request failed {Method} {Path}", request.Method, request.Path);
+            return JsonError.Write(StatusCodes.Status500InternalServerError, "internal error");
+        }
+    }
+
+    internal static bool TryParsePositiveId(string id, out long value) =>
+        long.TryParse(id, NumberStyles.Integer, CultureInfo.InvariantCulture, out value) && value >= 1;
+
+    private static DateTimeOffset TruncateToMicroseconds(DateTimeOffset value)
+    {
+        var utc = value.ToUniversalTime();
+        var ticks = utc.Ticks - (utc.Ticks % 10);
+        return new DateTimeOffset(ticks, TimeSpan.Zero);
     }
 }

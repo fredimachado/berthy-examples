@@ -67,6 +67,15 @@ app.Use(async (context, next) =>
         return;
     }
 
+    // /api/todos/{id} must keep the exact lowercase prefix (Go ServeMux is case-sensitive).
+    if (path is not null
+        && path.StartsWith("/api/todos/", StringComparison.OrdinalIgnoreCase)
+        && !path.StartsWith("/api/todos/", StringComparison.Ordinal))
+    {
+        await JsonError.Write(StatusCodes.Status404NotFound, "not found").ExecuteAsync(context);
+        return;
+    }
+
     if (path is not null
         && path.Equals("/version", StringComparison.OrdinalIgnoreCase)
         && !string.Equals(path, "/version", StringComparison.Ordinal))
@@ -89,6 +98,8 @@ if (!string.IsNullOrWhiteSpace(tododb))
     });
 
     app.MapPost("/api/todos", TodoCommands.CreateTodoAsync);
+    app.MapMethods("/api/todos/{id}", ["PATCH"], TodoCommands.PatchTodoAsync);
+    app.MapDelete("/api/todos/{id}", TodoCommands.DeleteTodoAsync);
 }
 
 app.MapFallback(() => JsonError.Write(StatusCodes.Status404NotFound, "not found"));
