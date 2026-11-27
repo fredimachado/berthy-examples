@@ -5,23 +5,8 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 namespace Todo.Tests;
 
-[Collection(ServiceCollection.Name)]
-public sealed class PublishTests
+public sealed class PublishStaticTests
 {
-    private static readonly TimeSpan PublishTimeout = TimeSpan.FromMinutes(5);
-    private static readonly string RepoRoot = Path.GetFullPath(
-        Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
-    private static readonly string ApiProject = Path.Combine(RepoRoot, "todo-dotnet", "Api", "Todo.Api.csproj");
-    private static readonly string WebDir = Path.Combine(RepoRoot, "todo-dotnet", "web");
-    private static readonly string ReadmePath = Path.Combine(RepoRoot, "todo-dotnet", "README.md");
-    private static readonly string RootReadmePath = Path.Combine(RepoRoot, "README.md");
-    private static readonly string WorkflowPath = Path.Combine(RepoRoot, ".github", "workflows", "todo-dotnet.yml");
-    private static readonly string VerifyScript = Path.Combine(RepoRoot, "todo-dotnet", "scripts", "verify.ps1");
-
-    private readonly ServiceFixture _services;
-
-    public PublishTests(ServiceFixture services) => _services = services;
-
     [Fact]
     public async Task UnknownRoutesDoNotServeTheSpa()
     {
@@ -64,6 +49,64 @@ public sealed class PublishTests
             Assert.DoesNotContain("<html", body, StringComparison.OrdinalIgnoreCase);
         }
     }
+}
+
+public sealed class PublishDocsTests
+{
+    private static readonly string RepoRoot = Path.GetFullPath(
+        Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
+    private static readonly string ReadmePath = Path.Combine(RepoRoot, "todo-dotnet", "README.md");
+    private static readonly string RootReadmePath = Path.Combine(RepoRoot, "README.md");
+    private static readonly string WorkflowPath = Path.Combine(RepoRoot, ".github", "workflows", "todo-dotnet.yml");
+    private static readonly string VerifyScript = Path.Combine(RepoRoot, "todo-dotnet", "scripts", "verify.ps1");
+
+    [Fact]
+    public void CleanCheckoutWalkthrough()
+    {
+        Assert.True(File.Exists(ReadmePath), "todo-dotnet/README.md must exist.");
+        Assert.True(File.Exists(WorkflowPath), ".github/workflows/todo-dotnet.yml must exist.");
+        Assert.True(File.Exists(VerifyScript), "todo-dotnet/scripts/verify.ps1 must exist.");
+
+        var readme = File.ReadAllText(ReadmePath);
+        Assert.Contains("aspire start", readme, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("verify.ps1", readme, StringComparison.Ordinal);
+        Assert.Contains("AspireWeb", readme, StringComparison.Ordinal);
+        Assert.Contains("PublishedWeb", readme, StringComparison.Ordinal);
+        Assert.Contains("dotnet publish", readme, StringComparison.Ordinal);
+        Assert.Contains("ConnectionStrings:tododb", readme, StringComparison.Ordinal);
+        Assert.Contains("ConnectionStrings:redis", readme, StringComparison.Ordinal);
+        Assert.Contains("todo:list", readme, StringComparison.Ordinal);
+        Assert.Contains("X-Cache", readme, StringComparison.Ordinal);
+
+        var rootReadme = File.ReadAllText(RootReadmePath);
+        Assert.Contains("[`todo-dotnet/`](todo-dotnet/README.md)", rootReadme, StringComparison.Ordinal);
+        Assert.Contains("Aspire", rootReadme, StringComparison.Ordinal);
+
+        var workflow = File.ReadAllText(WorkflowPath);
+        Assert.Contains("dotnet test todo-dotnet/Tests/Todo.Tests.csproj", workflow, StringComparison.Ordinal);
+        Assert.Contains("PublishedWeb", workflow, StringComparison.Ordinal);
+        Assert.Contains("AspireWeb", workflow, StringComparison.Ordinal);
+        Assert.Contains("workflow_dispatch", workflow, StringComparison.Ordinal);
+        Assert.Contains("actions/checkout@", workflow, StringComparison.Ordinal);
+
+        var verify = File.ReadAllText(VerifyScript);
+        Assert.Contains("PublishedWeb", verify, StringComparison.Ordinal);
+        Assert.Contains("PublishDir", verify, StringComparison.Ordinal);
+    }
+}
+
+[Collection(ServiceCollection.Name)]
+public sealed class PublishTests
+{
+    private static readonly TimeSpan PublishTimeout = TimeSpan.FromMinutes(5);
+    private static readonly string RepoRoot = Path.GetFullPath(
+        Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
+    private static readonly string ApiProject = Path.Combine(RepoRoot, "todo-dotnet", "Api", "Todo.Api.csproj");
+    private static readonly string WebDir = Path.Combine(RepoRoot, "todo-dotnet", "web");
+
+    private readonly ServiceFixture _services;
+
+    public PublishTests(ServiceFixture services) => _services = services;
 
     [Fact]
     public async Task ReplicaHeaderCoversPublishedRootAndErrors()
@@ -262,40 +305,6 @@ public sealed class PublishTests
             apiProcess?.Dispose();
             TryDeleteDirectory(publishDir);
         }
-    }
-
-    [Fact]
-    public void CleanCheckoutWalkthrough()
-    {
-        Assert.True(File.Exists(ReadmePath), "todo-dotnet/README.md must exist.");
-        Assert.True(File.Exists(WorkflowPath), ".github/workflows/todo-dotnet.yml must exist.");
-        Assert.True(File.Exists(VerifyScript), "todo-dotnet/scripts/verify.ps1 must exist.");
-
-        var readme = File.ReadAllText(ReadmePath);
-        Assert.Contains("aspire start", readme, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("verify.ps1", readme, StringComparison.Ordinal);
-        Assert.Contains("AspireWeb", readme, StringComparison.Ordinal);
-        Assert.Contains("PublishedWeb", readme, StringComparison.Ordinal);
-        Assert.Contains("dotnet publish", readme, StringComparison.Ordinal);
-        Assert.Contains("ConnectionStrings:tododb", readme, StringComparison.Ordinal);
-        Assert.Contains("ConnectionStrings:redis", readme, StringComparison.Ordinal);
-        Assert.Contains("todo:list", readme, StringComparison.Ordinal);
-        Assert.Contains("X-Cache", readme, StringComparison.Ordinal);
-
-        var rootReadme = File.ReadAllText(RootReadmePath);
-        Assert.Contains("[`todo-dotnet/`](todo-dotnet/README.md)", rootReadme, StringComparison.Ordinal);
-        Assert.Contains("Aspire", rootReadme, StringComparison.Ordinal);
-
-        var workflow = File.ReadAllText(WorkflowPath);
-        Assert.Contains("dotnet test todo-dotnet/Tests/Todo.Tests.csproj", workflow, StringComparison.Ordinal);
-        Assert.Contains("PublishedWeb", workflow, StringComparison.Ordinal);
-        Assert.Contains("AspireWeb", workflow, StringComparison.Ordinal);
-        Assert.Contains("workflow_dispatch", workflow, StringComparison.Ordinal);
-        Assert.Contains("actions/checkout@", workflow, StringComparison.Ordinal);
-
-        var verify = File.ReadAllText(VerifyScript);
-        Assert.Contains("PublishedWeb", verify, StringComparison.Ordinal);
-        Assert.Contains("PublishDir", verify, StringComparison.Ordinal);
     }
 
     private static (Process Process, Task<string> UrlTask) StartListeningDll(
