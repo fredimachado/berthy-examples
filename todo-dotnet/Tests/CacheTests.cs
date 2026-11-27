@@ -364,8 +364,12 @@ public sealed class CacheTests
         }
     }
 
-    [Fact]
-    public async Task MalformedCachedListIsRejectedAndRefilled()
+    [Theory]
+    [InlineData("[null]")]
+    [InlineData("[{}]")]
+    [InlineData(
+        """[{"id":1,"title":null,"done":false,"created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z"}]""")]
+    public async Task MalformedCachedListIsRejectedAndRefilled(string malformedJson)
     {
         await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
         Assert.Equal(0, (await MigrateProcess.RunAsync(database.ConnectionString)).ExitCode);
@@ -376,7 +380,36 @@ public sealed class CacheTests
         // Seed after ApiFactory construction — the factory flushes todo:list on create.
         await RedisAdmin.SetListBytesAsync(
             _services.RedisConnectionString,
-            "[null]"u8.ToArray());
+            Encoding.UTF8.GetBytes(malformedJson));
+
+        using (var miss = await client.GetAsync("/api/todos"))
+        {
+            Assert.Equal(HttpStatusCode.OK, miss.StatusCode);
+            Assert.Equal("miss", GetCacheHeader(miss));
+            Assert.Equal("[]", await miss.Content.ReadAsStringAsync());
+        }
+
+        using (var hit = await client.GetAsync("/api/todos"))
+        {
+            Assert.Equal(HttpStatusCode.OK, hit.StatusCode);
+            Assert.Equal("hit", GetCacheHeader(hit));
+            Assert.Equal("[]", await hit.Content.ReadAsStringAsync());
+        }
+    }
+
+    [Fact]
+    public async Task BrokenFillTokenIsRepairedOnRead()
+    {
+        await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
+        Assert.Equal(0, (await MigrateProcess.RunAsync(database.ConnectionString)).ExitCode);
+
+        await using var factory = CreateFactory(database.ConnectionString);
+        var client = factory.CreateClient();
+
+        Assert.False(TodoListCache.IsFillToken("tok:broken"));
+        await RedisAdmin.SetListBytesAsync(
+            _services.RedisConnectionString,
+            "tok:broken"u8.ToArray());
 
         using (var miss = await client.GetAsync("/api/todos"))
         {

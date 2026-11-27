@@ -19,6 +19,9 @@ internal sealed class TodoListCache
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        // Cached payloads must match the real list shape; reject [{}] and null titles as hits.
+        RespectRequiredConstructorParameters = true,
+        RespectNullableAnnotations = true,
     };
 
     private readonly IConnectionMultiplexer? _mux;
@@ -175,6 +178,10 @@ internal sealed class TodoListCache
         }
     }
 
+    /// <summary>
+    /// True only for a live reservation: <c>tok:</c> plus a 32-char GUID "N" form.
+    /// Values like <c>tok:broken</c> are corrupt and must be repaired.
+    /// </summary>
     internal static bool IsFillToken(RedisValue value)
     {
         if (!value.HasValue)
@@ -184,7 +191,8 @@ internal sealed class TodoListCache
 
         var text = (string?)value;
         return text is not null
-            && text.StartsWith(TokenPrefix, StringComparison.Ordinal);
+            && text.StartsWith(TokenPrefix, StringComparison.Ordinal)
+            && Guid.TryParseExact(text.AsSpan(TokenPrefix.Length), "N", out _);
     }
 
     private static bool TryParseList(RedisValue value, out TodoResponse[] items)
