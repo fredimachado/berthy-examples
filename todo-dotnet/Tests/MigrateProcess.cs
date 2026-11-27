@@ -5,17 +5,24 @@ namespace Todo.Tests;
 
 internal static class MigrateProcess
 {
-    private static readonly string ApiProject = Path.GetFullPath(
-        Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "Api", "Todo.Api.csproj"));
+    private static readonly string ApiDll = Path.Combine(AppContext.BaseDirectory, "Todo.Api.dll");
 
     internal static async Task<MigrateResult> RunAsync(
         string tododbConnectionString,
         CancellationToken cancellationToken = default)
     {
+        if (!File.Exists(ApiDll))
+        {
+            throw new InvalidOperationException(
+                $"Prebuilt migrator binary not found at '{ApiDll}'. Build Todo.Tests before running migrate.");
+        }
+
+        // Run the already-built DLL so concurrent migrators never contend on CSC writing Todo.Api.dll.
         var start = new ProcessStartInfo
         {
             FileName = "dotnet",
-            Arguments = $"run --project \"{ApiProject}\" --no-launch-profile -- migrate",
+            ArgumentList = { ApiDll, "migrate" },
+            WorkingDirectory = AppContext.BaseDirectory,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
