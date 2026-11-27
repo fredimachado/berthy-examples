@@ -5,6 +5,10 @@ internal static class DependencyHealth
 {
     internal static readonly TimeSpan Deadline = TimeSpan.FromSeconds(2);
 
+    private const int Pending = 0;
+    private const int SucceededInBudget = 1;
+    private const int Failed = 2;
+
     /// <summary>
     /// Runs probes concurrently under one shared deadline. Failures keep probe order.
     /// </summary>
@@ -15,13 +19,14 @@ internal static class DependencyHealth
         var deadlineTask = Task.Delay(Deadline, clock, ct);
 
         var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var failed = new bool[probes.Count];
+        var outcomes = new int[probes.Count];
         var tasks = new Task[probes.Count];
         for (var i = 0; i < probes.Count; i++)
         {
             var index = i;
             var probe = probes[i];
-            tasks[i] = ProbeAsync(probe, linked.Token, outcome => failed[index] = outcome);
+            // Probes run independently of the response wait; only the deadline gates the reply.
+            tasks[i] = ProbeAsync(probe, linked.Token, outcomes, index);
         }
 
         var probeTask = Task.WhenAll(tasks);
@@ -29,16 +34,12 @@ internal static class DependencyHealth
 
         if (completed == deadlineTask)
         {
-            // Capture unfinished probes before any cancellation work.
-            for (var i = 0; i < tasks.Length; i++)
+            // Pending → failed. Late success cannot overwrite a timeout (CAS from Pending only).
+            for (var i = 0; i < outcomes.Length; i++)
             {
-                if (!tasks[i].IsCompletedSuccessfully)
-                {
-                    failed[i] = true;
-                }
+                Interlocked.CompareExchange(ref outcomes[i], Failed, Pending);
             }
 
-            // Cancel and dispose off the response path — CancelAsync waits for callbacks.
             var toCleanup = linked;
             linked = null!;
             _ = CleanupAfterDeadlineAsync(toCleanup, tasks);
@@ -58,7 +59,7 @@ internal static class DependencyHealth
         var names = new List<string>(probes.Count);
         for (var i = 0; i < probes.Count; i++)
         {
-            if (failed[i])
+            if (Volatile.Read(ref outcomes[i]) != SucceededInBudget)
             {
                 names.Add(probes[i].Name);
             }
@@ -68,15 +69,19 @@ internal static class DependencyHealth
     }
 
     private static async Task ProbeAsync(
-        DependencyProbe probe, CancellationToken ct, Action<bool> setFailed)
+        DependencyProbe probe,
+        CancellationToken ct,
+        int[] outcomes,
+        int index)
     {
         try
         {
             await probe.CheckAsync(ct);
+            Interlocked.CompareExchange(ref outcomes[index], SucceededInBudget, Pending);
         }
         catch (Exception)
         {
-            setFailed(true);
+            Interlocked.CompareExchange(ref outcomes[index], Failed, Pending);
         }
     }
 

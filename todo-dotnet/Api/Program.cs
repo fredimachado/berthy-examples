@@ -2,7 +2,6 @@ using System.Net;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.EntityFrameworkCore;
-using StackExchange.Redis;
 
 if (args is ["migrate"])
 {
@@ -40,21 +39,11 @@ if (!string.IsNullOrWhiteSpace(tododb))
 }
 
 var redis = builder.Configuration.GetConnectionString("redis");
-if (!string.IsNullOrWhiteSpace(redis))
-{
-    builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
-    {
-        var options = ConfigurationOptions.Parse(redis);
-        options.AbortOnConnectFail = false;
-        return ConnectionMultiplexer.Connect(options);
-    });
-}
-
+builder.Services.AddSingleton(new AppRedis(string.IsNullOrWhiteSpace(redis) ? null : redis));
 builder.Services.AddSingleton<TodoListCache>(sp =>
-{
-    var mux = sp.GetService<IConnectionMultiplexer>();
-    return new TodoListCache(mux, sp.GetRequiredService<ILogger<TodoListCache>>());
-});
+    new TodoListCache(
+        sp.GetRequiredService<AppRedis>(),
+        sp.GetRequiredService<ILogger<TodoListCache>>()));
 
 var app = builder.Build();
 
@@ -144,16 +133,14 @@ app.MapGet("/health", async (IServiceProvider sp, CancellationToken ct) =>
         }),
         new("redis", async token =>
         {
-            // ConnectAsync inside the probe so a cold sync Connect cannot starve postgres or the deadline.
-            var redisCs = sp.GetRequiredService<IConfiguration>().GetConnectionString("redis");
-            if (string.IsNullOrWhiteSpace(redisCs))
+            // Shared app multiplexer; WaitAsync(token) applies the health deadline to the wait.
+            var appRedis = sp.GetRequiredService<AppRedis>();
+            if (!appRedis.IsConfigured)
             {
                 throw new InvalidOperationException("redis is not configured");
             }
 
-            var options = ConfigurationOptions.Parse(redisCs);
-            options.AbortOnConnectFail = false;
-            await using var mux = await ConnectionMultiplexer.ConnectAsync(options);
+            var mux = await appRedis.GetMultiplexerAsync(token);
             token.ThrowIfCancellationRequested();
             await mux.GetDatabase().PingAsync();
             token.ThrowIfCancellationRequested();

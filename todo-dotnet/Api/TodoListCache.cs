@@ -24,12 +24,12 @@ internal sealed class TodoListCache
         RespectNullableAnnotations = true,
     };
 
-    private readonly IConnectionMultiplexer? _mux;
+    private readonly AppRedis _redis;
     private readonly ILogger<TodoListCache> _logger;
 
-    public TodoListCache(IConnectionMultiplexer? mux, ILogger<TodoListCache> logger)
+    public TodoListCache(AppRedis redis, ILogger<TodoListCache> logger)
     {
-        _mux = mux;
+        _redis = redis;
         _logger = logger;
     }
 
@@ -40,7 +40,7 @@ internal sealed class TodoListCache
 
     internal async Task<TodoListResult> ListAsync(TodoDbContext db, CancellationToken ct)
     {
-        var redis = TryDatabase();
+        var redis = await TryDatabaseAsync(ct);
         RedisValue? corrupt = null;
         var liveToken = false;
 
@@ -139,7 +139,24 @@ internal sealed class TodoListCache
     /// </summary>
     internal async Task InvalidateAsync(CancellationToken ct)
     {
-        var redis = TryDatabase();
+        IDatabase? redis;
+        try
+        {
+            using var bound = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            bound.CancelAfter(InvalidationTimeout);
+            redis = await TryDatabaseAsync(bound.Token);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "cache unavailable");
+            return;
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            _logger.LogWarning("cache invalidation timed out");
+            return;
+        }
+
         if (redis is null)
         {
             return;
@@ -160,18 +177,19 @@ internal sealed class TodoListCache
         }
     }
 
-    private IDatabase? TryDatabase()
+    private async Task<IDatabase?> TryDatabaseAsync(CancellationToken ct)
     {
-        if (_mux is null)
+        if (!_redis.IsConfigured)
         {
             return null;
         }
 
         try
         {
-            return _mux.GetDatabase();
+            var mux = await _redis.GetMultiplexerAsync(ct);
+            return mux.GetDatabase();
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogWarning(ex, "cache unavailable");
             return null;

@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Time.Testing;
 
 namespace Todo.Tests;
@@ -160,6 +161,61 @@ public sealed class HealthTests
     }
 
     [Fact]
+    public async Task HealthLateSuccessAfterDeadlineStillReportsFailed()
+    {
+        var clock = new FakeTimeProvider();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var finish = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        async Task SucceedAfterBudgetAsync(CancellationToken ct)
+        {
+            entered.TrySetResult();
+            // Ignore cancellation so a late success can race the deadline classification.
+            await finish.Task;
+        }
+
+        var probes = new DependencyProbe[]
+        {
+            new("postgres", SucceedAfterBudgetAsync),
+            new("redis", async _ => await Task.CompletedTask),
+        };
+
+        var healthTask = DependencyHealth.FailedDependenciesAsync(probes, clock, CancellationToken.None);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        clock.Advance(TimeSpan.FromSeconds(2));
+        // Complete successfully after the budget expired — must not clear the timeout failure.
+        finish.TrySetResult();
+
+        var failed = await healthTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(new[] { "postgres" }, failed);
+    }
+
+    [Fact]
+    public async Task HealthAndCacheShareOneRedisConnection()
+    {
+        await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
+        Assert.Equal(0, (await MigrateProcess.RunAsync(database.ConnectionString)).ExitCode);
+
+        await using var factory = CreateFactory(database.ConnectionString, _services.RedisConnectionString);
+        var redis = factory.Services.GetRequiredService<AppRedis>();
+
+        var fromCachePath = await redis.GetMultiplexerAsync(CancellationToken.None);
+        var client = factory.CreateClient();
+        using (var health = await client.GetAsync("/health"))
+        {
+            Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+        }
+
+        var afterHealth = await redis.GetMultiplexerAsync(CancellationToken.None);
+        Assert.Same(fromCachePath, afterHealth);
+
+        using var list = await client.GetAsync("/api/todos");
+        Assert.Equal(HttpStatusCode.OK, list.StatusCode);
+        Assert.Same(fromCachePath, await redis.GetMultiplexerAsync(CancellationToken.None));
+    }
+
+    [Fact]
     public async Task HealthFirstRequestWithPendingRedisStillProbesPostgres()
     {
         await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
@@ -169,29 +225,47 @@ public sealed class HealthTests
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;
-        var acceptLoop = AcceptAndHoldAsync(listener);
+        var heldClients = new List<TcpClient>();
+        var acceptLoop = AcceptAndHoldAsync(listener, heldClients);
 
-        await using var factory = CreateFactory(database.ConnectionString, $"localhost:{port}");
-        var client = factory.CreateClient();
-
-        var sw = Stopwatch.StartNew();
-        using var response = await client.GetAsync("/health");
-        sw.Stop();
-
-        Assert.True(
-            sw.Elapsed < TimeSpan.FromSeconds(5),
-            $"cold Redis connect starved the health deadline: {sw.Elapsed}");
-        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
-        AssertFailed(await response.Content.ReadAsStringAsync(), "redis");
-
-        listener.Stop();
         try
         {
-            await acceptLoop.WaitAsync(TimeSpan.FromSeconds(1));
+            await using var factory = CreateFactory(database.ConnectionString, $"localhost:{port}");
+            var client = factory.CreateClient();
+
+            var sw = Stopwatch.StartNew();
+            using var response = await client.GetAsync("/health");
+            sw.Stop();
+
+            Assert.True(
+                sw.Elapsed < TimeSpan.FromSeconds(5),
+                $"cold Redis connect starved the health deadline: {sw.Elapsed}");
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+            AssertFailed(await response.Content.ReadAsStringAsync(), "redis");
         }
-        catch (Exception)
+        finally
         {
-            // Listener stopped; accept loop may fault.
+            TcpClient[] snapshot;
+            lock (heldClients)
+            {
+                snapshot = heldClients.ToArray();
+                heldClients.Clear();
+            }
+
+            foreach (var held in snapshot)
+            {
+                held.Dispose();
+            }
+
+            listener.Stop();
+            try
+            {
+                await acceptLoop.WaitAsync(TimeSpan.FromSeconds(1));
+            }
+            catch (Exception)
+            {
+                // Listener stopped; accept loop may fault.
+            }
         }
     }
 
@@ -259,15 +333,18 @@ public sealed class HealthTests
         AssertFailed(await response.Content.ReadAsStringAsync(), "postgres");
     }
 
-    private static async Task AcceptAndHoldAsync(TcpListener listener)
+    private static async Task AcceptAndHoldAsync(TcpListener listener, List<TcpClient> heldClients)
     {
         try
         {
             while (true)
             {
                 var client = await listener.AcceptTcpClientAsync();
-                // Leave the socket open with no Redis reply so the handshake stalls.
-                _ = client;
+                // Retain until the assertion finishes; dispose in the caller's teardown.
+                lock (heldClients)
+                {
+                    heldClients.Add(client);
+                }
             }
         }
         catch (ObjectDisposedException)
