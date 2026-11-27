@@ -117,6 +117,8 @@ public sealed class CreateTests
                 "invalid JSON: json: unknown field \"id\""),
             ("unknown field apostrophe", "{\"title\":\"x\",\"owner's\":1}", HttpStatusCode.BadRequest,
                 "invalid JSON: json: unknown field \"owner's\""),
+            ("unknown field quoted", "{\"title\":\"x\",\"a\\\"b\\\\c\":1}", HttpStatusCode.BadRequest,
+                "invalid JSON: json: unknown field \"a\\\"b\\\\c\""),
             ("trailing object", """{"title":"x"} {}""", HttpStatusCode.BadRequest,
                 "invalid JSON: unexpected data after the JSON object"),
             ("empty object", "{}", HttpStatusCode.UnprocessableEntity,
@@ -263,6 +265,41 @@ public sealed class CreateTests
         }
 
         Assert.Equal(2, await CountTodosAsync(database.ConnectionString));
+    }
+
+    [Fact]
+    public async Task UnpairedSurrogatesBecomeReplacementChars()
+    {
+        await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
+        Assert.Equal(0, (await MigrateProcess.RunAsync(database.ConnectionString)).ExitCode);
+
+        await using var factory = CreateFactory(database.ConnectionString, replica: "");
+        var client = factory.CreateClient();
+
+        // Go encoding/json replaces unpaired UTF-16 surrogates with U+FFFD before validation.
+        using var response = await PostJsonAsync(client, "{\"title\":\"\\uD800x\\uDFFF\"}");
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        using var doc = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+        var title = doc.RootElement.GetProperty("title").GetString();
+        Assert.Equal("\uFFFDx\uFFFD", title);
+        Assert.Equal(1, await CountTodosAsync(database.ConnectionString));
+    }
+
+    [Fact]
+    public async Task LaterNullTitleDoesNotClearEarlierValue()
+    {
+        await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
+        Assert.Equal(0, (await MigrateProcess.RunAsync(database.ConnectionString)).ExitCode);
+
+        await using var factory = CreateFactory(database.ConnectionString, replica: "");
+        var client = factory.CreateClient();
+
+        // Go: JSON null into a string has no effect, so Title:null must not wipe "buy milk".
+        using var response = await PostJsonAsync(client, """{"title":"buy milk","Title":null}""");
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        using var doc = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+        Assert.Equal("buy milk", doc.RootElement.GetProperty("title").GetString());
+        Assert.Equal(1, await CountTodosAsync(database.ConnectionString));
     }
 
     [Fact]
