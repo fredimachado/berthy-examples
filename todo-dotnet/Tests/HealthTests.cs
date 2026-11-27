@@ -331,9 +331,10 @@ public sealed class HealthTests
         {
             allowPostgresFinish.TrySetResult();
             holdTimerCallbacks.Set();
+            // No timeout: disposal must wait until Advance leaves Wait() on the gate.
             if (advanceTask is not null)
             {
-                await advanceTask.WaitAsync(TimeSpan.FromSeconds(5));
+                await advanceTask;
             }
         }
     }
