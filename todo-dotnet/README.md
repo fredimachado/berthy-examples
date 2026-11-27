@@ -42,7 +42,7 @@ message or log.
 
 | Request | What it does |
 | --- | --- |
-| `GET /` | The React page (Vite in Aspire; Kestrel `wwwroot` after publish). With a replica configured, the response carries `X-Served-By`. |
+| `GET /` | The React page (Vite in Aspire; Kestrel `wwwroot` after publish). On the published Kestrel endpoint, a configured replica adds `X-Served-By` (Aspire's Vite server does not). |
 | `GET /health` | `200 {"status":"ok"}` when Postgres and Redis both answer within 2 seconds, else `503` with the failed dependency names. |
 | `GET /version` | Build version, commit, and optional replica. |
 | `GET /api/todos` | The list from Redis key `todo:list` (60s TTL) or Postgres on a miss. `X-Cache` is `hit` or `miss`. |

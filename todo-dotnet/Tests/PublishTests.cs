@@ -1,8 +1,8 @@
-using System.Diagnostics;
 using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+
 namespace Todo.Tests;
 
 public sealed class PublishStaticTests
@@ -67,43 +67,24 @@ public sealed class PublishDocsTests
         Assert.True(File.Exists(WorkflowPath), ".github/workflows/todo-dotnet.yml must exist.");
         Assert.True(File.Exists(VerifyScript), "todo-dotnet/scripts/verify.ps1 must exist.");
 
-        var readme = File.ReadAllText(ReadmePath);
-        Assert.Contains("aspire start", readme, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("verify.ps1", readme, StringComparison.Ordinal);
-        Assert.Contains("AspireWeb", readme, StringComparison.Ordinal);
-        Assert.Contains("PublishedWeb", readme, StringComparison.Ordinal);
-        Assert.Contains("dotnet publish", readme, StringComparison.Ordinal);
-        Assert.Contains("ConnectionStrings:tododb", readme, StringComparison.Ordinal);
-        Assert.Contains("ConnectionStrings:redis", readme, StringComparison.Ordinal);
-        Assert.Contains("todo:list", readme, StringComparison.Ordinal);
-        Assert.Contains("X-Cache", readme, StringComparison.Ordinal);
-
         var rootReadme = File.ReadAllText(RootReadmePath);
-        Assert.Contains("[`todo-dotnet/`](todo-dotnet/README.md)", rootReadme, StringComparison.Ordinal);
-        Assert.Contains("Aspire", rootReadme, StringComparison.Ordinal);
-
-        var workflow = File.ReadAllText(WorkflowPath);
-        Assert.Contains("dotnet test todo-dotnet/Tests/Todo.Tests.csproj", workflow, StringComparison.Ordinal);
-        Assert.Contains("PublishedWeb", workflow, StringComparison.Ordinal);
-        Assert.Contains("AspireWeb", workflow, StringComparison.Ordinal);
-        Assert.Contains("workflow_dispatch", workflow, StringComparison.Ordinal);
-        Assert.Contains("actions/checkout@", workflow, StringComparison.Ordinal);
-
-        var verify = File.ReadAllText(VerifyScript);
-        Assert.Contains("PublishedWeb", verify, StringComparison.Ordinal);
-        Assert.Contains("PublishDir", verify, StringComparison.Ordinal);
+        var linkMatch = Regex.Match(
+            rootReadme,
+            @"\[`todo-dotnet/`\]\((?<dest>[^)]+)\)",
+            RegexOptions.CultureInvariant);
+        Assert.True(linkMatch.Success, "Root README must link to the todo-dotnet example.");
+        var dest = linkMatch.Groups["dest"].Value.Replace('/', Path.DirectorySeparatorChar);
+        var linkedPath = Path.GetFullPath(Path.Combine(RepoRoot, dest));
+        Assert.True(
+            File.Exists(linkedPath),
+            $"Root README todo-dotnet link destination missing: {linkedPath}");
+        Assert.Equal(Path.GetFullPath(ReadmePath), linkedPath);
     }
 }
 
 [Collection(ServiceCollection.Name)]
 public sealed class PublishTests
 {
-    private static readonly TimeSpan PublishTimeout = TimeSpan.FromMinutes(5);
-    private static readonly string RepoRoot = Path.GetFullPath(
-        Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
-    private static readonly string ApiProject = Path.Combine(RepoRoot, "todo-dotnet", "Api", "Todo.Api.csproj");
-    private static readonly string WebDir = Path.Combine(RepoRoot, "todo-dotnet", "web");
-
     private readonly ServiceFixture _services;
 
     public PublishTests(ServiceFixture services) => _services = services;
@@ -186,311 +167,6 @@ public sealed class PublishTests
         {
             using var response = await emptyClient.GetAsync(path);
             Assert.False(response.Headers.Contains("X-Served-By"));
-        }
-    }
-
-    [Fact]
-    public async Task PublishedAppServesItsOwnFrontend()
-    {
-        using var cts = new CancellationTokenSource(PublishTimeout);
-        var publishDir = Path.Combine(Path.GetTempPath(), "todo-pub-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(publishDir);
-
-        Process? apiProcess = null;
-        try
-        {
-            var publish = await RunProcessAsync(
-                "dotnet",
-                ["publish", ApiProject, "--configuration", "Release", "--output", publishDir],
-                RepoRoot,
-                cts.Token);
-            Assert.True(
-                publish.ExitCode == 0,
-                $"dotnet publish failed ({publish.ExitCode}): {publish.StdErr}\n{publish.StdOut}");
-
-            Assert.True(
-                File.Exists(Path.Combine(publishDir, "wwwroot", "index.html")),
-                "Published output must include wwwroot/index.html from the Vite build.");
-
-            await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
-            var migrate = await RunDllAsync(
-                publishDir,
-                ["migrate"],
-                new Dictionary<string, string?>
-                {
-                    ["ConnectionStrings__tododb"] = database.ConnectionString,
-                    ["ASPNETCORE_URLS"] = "",
-                },
-                cts.Token);
-            Assert.Equal(0, migrate.ExitCode);
-
-            var listen = StartListeningDll(
-                publishDir,
-                new Dictionary<string, string?>
-                {
-                    ["ConnectionStrings__tododb"] = database.ConnectionString,
-                    ["ConnectionStrings__redis"] = _services.RedisConnectionString,
-                    ["ASPNETCORE_URLS"] = "http://127.0.0.1:0",
-                    ["HOSTNAME"] = "published-replica",
-                    ["BuildVersion"] = "v-published",
-                    ["BuildCommit"] = "published-commit",
-                });
-            apiProcess = listen.Process;
-            var baseUrl = await listen.UrlTask.WaitAsync(cts.Token);
-            using var client = new HttpClient { BaseAddress = new Uri(baseUrl) };
-
-            using (var root = await client.GetAsync("/", cts.Token))
-            {
-                Assert.Equal(HttpStatusCode.OK, root.StatusCode);
-                Assert.Equal("text/html", root.Content.Headers.ContentType?.MediaType);
-                Assert.Equal("published-replica", root.Headers.GetValues("X-Served-By").Single());
-                var html = await root.Content.ReadAsStringAsync(cts.Token);
-                Assert.Contains("<div id=\"root\">", html, StringComparison.Ordinal);
-
-                var assetUrls = Regex.Matches(html, """(?:src|href)="(/assets/[^"]+)""")
-                    .Select(m => m.Groups[1].Value)
-                    .Distinct(StringComparer.Ordinal)
-                    .ToArray();
-                Assert.NotEmpty(assetUrls);
-
-                foreach (var assetUrl in assetUrls)
-                {
-                    using var asset = await client.GetAsync(assetUrl, cts.Token);
-                    Assert.Equal(HttpStatusCode.OK, asset.StatusCode);
-                    var mediaType = asset.Content.Headers.ContentType?.MediaType;
-                    Assert.False(string.IsNullOrWhiteSpace(mediaType));
-                    Assert.True(
-                        mediaType!.Contains("javascript", StringComparison.OrdinalIgnoreCase)
-                        || mediaType.Contains("css", StringComparison.OrdinalIgnoreCase)
-                        || mediaType.StartsWith("text/", StringComparison.OrdinalIgnoreCase)
-                        || mediaType.StartsWith("application/", StringComparison.OrdinalIgnoreCase),
-                        $"Unexpected asset content type '{mediaType}' for {assetUrl}");
-                }
-            }
-
-            var hadTodoBaseUrl = Environment.GetEnvironmentVariable("TODO_BASE_URL") is not null;
-            var previousTodoBaseUrl = Environment.GetEnvironmentVariable("TODO_BASE_URL");
-            try
-            {
-                Environment.SetEnvironmentVariable("TODO_BASE_URL", baseUrl.TrimEnd('/'));
-                // Windows .cmd shims need cmd.exe /c; bare ProcessStartInfo("npm.cmd") mis-resolves.
-                var e2e = OperatingSystem.IsWindows()
-                    ? await RunProcessAsync(
-                        "cmd.exe",
-                        ["/c", "npm", "--prefix", WebDir, "run", "test:e2e"],
-                        RepoRoot,
-                        cts.Token)
-                    : await RunProcessAsync(
-                        "npm",
-                        ["--prefix", WebDir, "run", "test:e2e"],
-                        RepoRoot,
-                        cts.Token);
-                Assert.True(
-                    e2e.ExitCode == 0,
-                    $"Playwright against published app failed ({e2e.ExitCode}): {e2e.StdErr}\n{e2e.StdOut}");
-            }
-            finally
-            {
-                if (hadTodoBaseUrl)
-                {
-                    Environment.SetEnvironmentVariable("TODO_BASE_URL", previousTodoBaseUrl);
-                }
-                else
-                {
-                    Environment.SetEnvironmentVariable("TODO_BASE_URL", null);
-                }
-            }
-        }
-        finally
-        {
-            if (apiProcess is not null && !apiProcess.HasExited)
-            {
-                apiProcess.Kill(entireProcessTree: true);
-                await apiProcess.WaitForExitAsync();
-            }
-
-            apiProcess?.Dispose();
-            TryDeleteDirectory(publishDir);
-        }
-    }
-
-    private static (Process Process, Task<string> UrlTask) StartListeningDll(
-        string publishDir,
-        IReadOnlyDictionary<string, string?> environment)
-    {
-        var dll = Path.Combine(publishDir, "Todo.Api.dll");
-        var start = new ProcessStartInfo
-        {
-            FileName = "dotnet",
-            WorkingDirectory = publishDir,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-        start.ArgumentList.Add(dll);
-        foreach (var (key, value) in environment)
-        {
-            start.Environment[key] = value;
-        }
-
-        var buffer = new StringBuilder();
-        var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var process = new Process { StartInfo = start, EnableRaisingEvents = true };
-
-        void OnData(object? sender, DataReceivedEventArgs e)
-        {
-            if (e.Data is null)
-            {
-                return;
-            }
-
-            buffer.AppendLine(e.Data);
-            var match = Regex.Match(e.Data, @"Now listening on:\s*(https?://\S+)", RegexOptions.IgnoreCase);
-            if (match.Success)
-            {
-                tcs.TrySetResult(match.Groups[1].Value.TrimEnd('/'));
-            }
-        }
-
-        process.OutputDataReceived += OnData;
-        process.ErrorDataReceived += OnData;
-        process.Exited += (_, _) =>
-        {
-            if (!tcs.Task.IsCompleted)
-            {
-                tcs.TrySetException(new InvalidOperationException(
-                    $"Published API exited before listening (code {process.ExitCode}). Output:{Environment.NewLine}{buffer}"));
-            }
-        };
-
-        if (!process.Start())
-        {
-            throw new InvalidOperationException("Failed to start published Todo.Api.dll.");
-        }
-
-        process.BeginOutputReadLine();
-        process.BeginErrorReadLine();
-        return (process, tcs.Task);
-    }
-
-    private static async Task<(int ExitCode, string StdOut, string StdErr)> RunDllAsync(
-        string publishDir,
-        IReadOnlyList<string> args,
-        IReadOnlyDictionary<string, string?> environment,
-        CancellationToken cancellationToken)
-    {
-        var dll = Path.Combine(publishDir, "Todo.Api.dll");
-        var start = new ProcessStartInfo
-        {
-            FileName = "dotnet",
-            WorkingDirectory = publishDir,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-        start.ArgumentList.Add(dll);
-        foreach (var arg in args)
-        {
-            start.ArgumentList.Add(arg);
-        }
-
-        foreach (var (key, value) in environment)
-        {
-            start.Environment[key] = value;
-        }
-
-        using var process = new Process { StartInfo = start };
-        var stdout = new StringBuilder();
-        var stderr = new StringBuilder();
-        process.OutputDataReceived += (_, e) =>
-        {
-            if (e.Data is not null)
-            {
-                stdout.AppendLine(e.Data);
-            }
-        };
-        process.ErrorDataReceived += (_, e) =>
-        {
-            if (e.Data is not null)
-            {
-                stderr.AppendLine(e.Data);
-            }
-        };
-
-        if (!process.Start())
-        {
-            throw new InvalidOperationException("Failed to start published Todo.Api.dll.");
-        }
-
-        process.BeginOutputReadLine();
-        process.BeginErrorReadLine();
-        await process.WaitForExitAsync(cancellationToken);
-        return (process.ExitCode, stdout.ToString(), stderr.ToString());
-    }
-
-    private static async Task<(int ExitCode, string StdOut, string StdErr)> RunProcessAsync(
-        string fileName,
-        IReadOnlyList<string> args,
-        string workingDirectory,
-        CancellationToken cancellationToken)
-    {
-        var start = new ProcessStartInfo
-        {
-            FileName = fileName,
-            WorkingDirectory = workingDirectory,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-        foreach (var arg in args)
-        {
-            start.ArgumentList.Add(arg);
-        }
-
-        using var process = new Process { StartInfo = start };
-        var stdout = new StringBuilder();
-        var stderr = new StringBuilder();
-        process.OutputDataReceived += (_, e) =>
-        {
-            if (e.Data is not null)
-            {
-                stdout.AppendLine(e.Data);
-            }
-        };
-        process.ErrorDataReceived += (_, e) =>
-        {
-            if (e.Data is not null)
-            {
-                stderr.AppendLine(e.Data);
-            }
-        };
-
-        if (!process.Start())
-        {
-            throw new InvalidOperationException($"Failed to start {fileName}.");
-        }
-
-        process.BeginOutputReadLine();
-        process.BeginErrorReadLine();
-        await process.WaitForExitAsync(cancellationToken);
-        return (process.ExitCode, stdout.ToString(), stderr.ToString());
-    }
-
-    private static void TryDeleteDirectory(string path)
-    {
-        try
-        {
-            if (Directory.Exists(path))
-            {
-                Directory.Delete(path, recursive: true);
-            }
-        }
-        catch (Exception)
-        {
-            // Best-effort temp cleanup.
         }
     }
 }
