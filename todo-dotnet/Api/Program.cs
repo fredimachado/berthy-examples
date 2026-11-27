@@ -23,6 +23,12 @@ if (args is ["plant-migration-conflict"])
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Go's ServeMux treats /api/todos and /api/todos/ as different paths.
+builder.Services.Configure<RouteOptions>(options =>
+{
+    options.AppendTrailingSlash = false;
+});
+
 var hostName = ResolveHostName(builder.Configuration);
 var build = BuildInfo.ReadBuildInfo(builder.Configuration, hostName);
 
@@ -42,6 +48,19 @@ if (build.Replica is { Length: > 0 } replica)
         await next();
     });
 }
+
+// Endpoint routing collapses /api/todos and /api/todos/; Go's mux does not.
+app.Use(async (context, next) =>
+{
+    var path = context.Request.Path.Value;
+    if (path is { Length: > 1 } && path.EndsWith('/'))
+    {
+        await JsonError.Write(StatusCodes.Status404NotFound, "not found").ExecuteAsync(context);
+        return;
+    }
+
+    await next();
+});
 
 app.MapGet("/version", () => Results.Json(build, AppJson.Options));
 

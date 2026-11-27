@@ -44,7 +44,8 @@ if ($todosJson -isnot [System.Array]) {
     throw "GET /api/todos expected a JSON array root, got $($todosJson.GetType().FullName): $todosContent"
 }
 
-$beforeCount = @($todosJson).Length
+# Assign the parsed array, then read .Length (do not wrap ConvertFrom-Json in @(...).Length).
+$beforeCount = $todosJson.Length
 
 $createBody = '{"title":"  buy milk  "}'
 $createResponse = Invoke-WebRequest -Uri $todosUrl -Method POST -Body $createBody -ContentType 'application/json'
@@ -71,18 +72,34 @@ if ($location -ne $expectedLocation) {
 }
 
 $listAfterCreate = Invoke-WebRequest -Uri $todosUrl -Method GET
-$listJson = ([string]$listAfterCreate.Content) | ConvertFrom-Json -NoEnumerate
-$afterCreateCount = @($listJson).Length
+$listContent = [string]$listAfterCreate.Content
+$listJson = $listContent | ConvertFrom-Json -NoEnumerate
+if ($listJson -isnot [System.Array]) {
+    throw "GET /api/todos after create expected a JSON array, got $($listJson.GetType().FullName): $listContent"
+}
+$afterCreateCount = $listJson.Length
 if ($afterCreateCount -ne ($beforeCount + 1)) {
     throw "GET /api/todos after create expected $($beforeCount + 1) rows, got $afterCreateCount"
 }
 
-$listed = @($listJson) | Where-Object { [long]$_.id -eq $createdId } | Select-Object -First 1
-if (-not $listed) {
+$listed = $null
+foreach ($item in $listJson) {
+    if ([long]$item.id -eq $createdId) {
+        $listed = $item
+        break
+    }
+}
+if ($null -eq $listed) {
     throw "GET /api/todos missing created id $createdId"
 }
 if ([string]$listed.title -ne 'buy milk') {
     throw "listed title='$($listed.title)', want 'buy milk'"
+}
+if ([string]$listed.created_at -ne [string]$created.created_at) {
+    throw "POST/GET created_at mismatch: post='$($created.created_at)' get='$($listed.created_at)'"
+}
+if ([string]$listed.updated_at -ne [string]$created.updated_at) {
+    throw "POST/GET updated_at mismatch: post='$($created.updated_at)' get='$($listed.updated_at)'"
 }
 
 # Literal null → 422 title validation; must not write a second row.
@@ -102,10 +119,15 @@ if ([string]$nullPayload.error -ne 'title must be 1 to 200 characters') {
     throw "POST null body=$nullBody"
 }
 
-$listFinal = Invoke-WebRequest -Uri $todosUrl -Method GET
-$finalCount = @(([string]$listFinal.Content) | ConvertFrom-Json -NoEnumerate).Length
+$listFinalResponse = Invoke-WebRequest -Uri $todosUrl -Method GET
+$listFinalContent = [string]$listFinalResponse.Content
+$listFinalJson = $listFinalContent | ConvertFrom-Json -NoEnumerate
+if ($listFinalJson -isnot [System.Array]) {
+    throw "GET /api/todos final expected a JSON array, got $($listFinalJson.GetType().FullName): $listFinalContent"
+}
+$finalCount = $listFinalJson.Length
 if ($finalCount -ne ($beforeCount + 1)) {
     throw "after POST null expected $($beforeCount + 1) rows, got $finalCount"
 }
 
-Write-Host "smoke ok: version=$($payload.version) commit=$($payload.commit) createdId=$createdId todos=$($listFinal.Content)"
+Write-Host "smoke ok: version=$($payload.version) commit=$($payload.commit) createdId=$createdId todos=$listFinalContent"

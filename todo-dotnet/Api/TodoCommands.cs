@@ -1,6 +1,5 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using Microsoft.EntityFrameworkCore;
 
 internal static class TodoCommands
 {
@@ -29,14 +28,8 @@ internal static class TodoCommands
 
         try
         {
-            var now = DateTimeOffset.UtcNow;
-            var row = new TodoRow
-            {
-                Title = title!.Value,
-                Done = false,
-                CreatedAt = now,
-                UpdatedAt = now,
-            };
+            // Only the title is written; done/timestamps come from database defaults (RETURNING).
+            var row = new TodoRow { Title = title!.Value };
             db.Todos.Add(row);
             await db.SaveChangesAsync(ct);
 

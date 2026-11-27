@@ -27,18 +27,21 @@ internal sealed class TodoDbContext(DbContextOptions<TodoDbContext> options) : D
         todos.Property(t => t.Done)
             .HasColumnName("done")
             .IsRequired()
-            .HasDefaultValue(false);
+            .HasDefaultValue(false)
+            .ValueGeneratedOnAdd();
 
         todos.Property(t => t.CreatedAt)
             .HasColumnName("created_at")
             .HasColumnType("timestamp with time zone")
             .IsRequired()
-            .HasDefaultValueSql("now()");
+            .HasDefaultValueSql("now()")
+            .ValueGeneratedOnAdd();
 
         todos.Property(t => t.UpdatedAt)
             .HasColumnName("updated_at")
             .HasColumnType("timestamp with time zone")
             .IsRequired()
-            .HasDefaultValueSql("now()");
+            .HasDefaultValueSql("now()")
+            .ValueGeneratedOnAdd();
     }
 }

@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using Microsoft.AspNetCore.Mvc.Testing;
 using Npgsql;
 
 namespace Todo.Tests;
@@ -107,16 +108,21 @@ public sealed class CreateTests
         await using var factory = CreateFactory(database.ConnectionString, replica: "replica-create");
         var client = factory.CreateClient();
 
-        var cases = new (string Name, string Body, HttpStatusCode Status)[]
+        var cases = new (string Name, string Body, HttpStatusCode Status, string? ExactError)[]
         {
-            ("empty", "", HttpStatusCode.BadRequest),
-            ("malformed", "title=x", HttpStatusCode.BadRequest),
-            ("wrong type", """{"title":5}""", HttpStatusCode.BadRequest),
-            ("unknown field", """{"title":"x","id":9}""", HttpStatusCode.BadRequest),
-            ("trailing object", """{"title":"x"} {}""", HttpStatusCode.BadRequest),
-            ("empty object", "{}", HttpStatusCode.UnprocessableEntity),
-            ("null title", """{"title":null}""", HttpStatusCode.UnprocessableEntity),
-            ("literal null", "null", HttpStatusCode.UnprocessableEntity),
+            ("empty", "", HttpStatusCode.BadRequest, null),
+            ("malformed", "title=x", HttpStatusCode.BadRequest, null),
+            ("wrong type", """{"title":5}""", HttpStatusCode.BadRequest, null),
+            ("unknown field", """{"title":"x","id":9}""", HttpStatusCode.BadRequest,
+                "invalid JSON: json: unknown field \"id\""),
+            ("trailing object", """{"title":"x"} {}""", HttpStatusCode.BadRequest,
+                "invalid JSON: unexpected data after the JSON object"),
+            ("empty object", "{}", HttpStatusCode.UnprocessableEntity,
+                "title must be 1 to 200 characters"),
+            ("null title", """{"title":null}""", HttpStatusCode.UnprocessableEntity,
+                "title must be 1 to 200 characters"),
+            ("literal null", "null", HttpStatusCode.UnprocessableEntity,
+                "title must be 1 to 200 characters"),
         };
 
         foreach (var tc in cases)
@@ -131,13 +137,11 @@ public sealed class CreateTests
             Assert.Equal("replica-create", response.Headers.GetValues("X-Served-By").Single());
 
             using var doc = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
-            Assert.False(string.IsNullOrEmpty(doc.RootElement.GetProperty("error").GetString()));
-
-            if (tc.Status == HttpStatusCode.UnprocessableEntity)
+            var error = doc.RootElement.GetProperty("error").GetString();
+            Assert.False(string.IsNullOrEmpty(error));
+            if (tc.ExactError is not null)
             {
-                Assert.Equal(
-                    "title must be 1 to 200 characters",
-                    doc.RootElement.GetProperty("error").GetString());
+                Assert.Equal(tc.ExactError, error);
             }
         }
 
@@ -198,6 +202,77 @@ public sealed class CreateTests
         Assert.DoesNotContain("Connection", body, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public async Task TrailingSlashPostDoesNotCreate()
+    {
+        await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
+        Assert.Equal(0, (await MigrateProcess.RunAsync(database.ConnectionString)).ExitCode);
+
+        await using var factory = CreateFactory(database.ConnectionString, replica: "");
+        // Do not follow redirects: a slash redirect must not become a successful create.
+        var client = factory.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
+
+        using var response = await PostJsonAsync(client, """{"title":"slash"}""", path: "/api/todos/");
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        await AssertExactJsonErrorAsync(response, "not found");
+        Assert.Equal(0, await CountTodosAsync(database.ConnectionString));
+    }
+
+    [Fact]
+    public async Task MixedCaseTitleFieldIsAcceptedAndUnknownRejected()
+    {
+        await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
+        Assert.Equal(0, (await MigrateProcess.RunAsync(database.ConnectionString)).ExitCode);
+
+        await using var factory = CreateFactory(database.ConnectionString, replica: "");
+        var client = factory.CreateClient();
+
+        using (var ok = await PostJsonAsync(client, """{"Title":"  Mixed  "}"""))
+        {
+            Assert.Equal(HttpStatusCode.Created, ok.StatusCode);
+            using var doc = await JsonDocument.ParseAsync(await ok.Content.ReadAsStreamAsync());
+            Assert.Equal("Mixed", doc.RootElement.GetProperty("title").GetString());
+        }
+
+        using (var upper = await PostJsonAsync(client, """{"TITLE":"upper"}"""))
+        {
+            Assert.Equal(HttpStatusCode.Created, upper.StatusCode);
+        }
+
+        using (var unknown = await PostJsonAsync(client, """{"title":"x","id":9}"""))
+        {
+            Assert.Equal(HttpStatusCode.BadRequest, unknown.StatusCode);
+            await AssertExactJsonErrorAsync(unknown, "invalid JSON: json: unknown field \"id\"");
+        }
+
+        Assert.Equal(2, await CountTodosAsync(database.ConnectionString));
+    }
+
+    [Fact]
+    public async Task PostAndGetShareDatabaseTimestamps()
+    {
+        await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
+        Assert.Equal(0, (await MigrateProcess.RunAsync(database.ConnectionString)).ExitCode);
+
+        await using var factory = CreateFactory(database.ConnectionString, replica: "");
+        var client = factory.CreateClient();
+
+        using var created = await PostJsonAsync(client, """{"title":"ts"}""");
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        using var createdDoc = await JsonDocument.ParseAsync(await created.Content.ReadAsStreamAsync());
+        var id = createdDoc.RootElement.GetProperty("id").GetInt64();
+        var createdAt = createdDoc.RootElement.GetProperty("created_at").GetString();
+        var updatedAt = createdDoc.RootElement.GetProperty("updated_at").GetString();
+        Assert.False(string.IsNullOrWhiteSpace(createdAt));
+        Assert.Equal(createdAt, updatedAt);
+
+        using var list = await client.GetAsync("/api/todos");
+        using var listDoc = await JsonDocument.ParseAsync(await list.Content.ReadAsStreamAsync());
+        var row = listDoc.RootElement.EnumerateArray().Single(e => e.GetProperty("id").GetInt64() == id);
+        Assert.Equal(createdAt, row.GetProperty("created_at").GetString());
+        Assert.Equal(updatedAt, row.GetProperty("updated_at").GetString());
+    }
+
     private ApiFactory CreateFactory(string connectionString, string replica) =>
         new(new Dictionary<string, string?>
         {
@@ -208,11 +283,14 @@ public sealed class CreateTests
             ["HOSTNAME"] = replica,
         });
 
-    private static async Task<HttpResponseMessage> PostJsonAsync(HttpClient client, string body)
+    private static async Task<HttpResponseMessage> PostJsonAsync(
+        HttpClient client,
+        string body,
+        string path = "/api/todos")
     {
         var content = new ByteArrayContent(Encoding.UTF8.GetBytes(body));
         content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
-        return await client.PostAsync("/api/todos", content);
+        return await client.PostAsync(path, content);
     }
 
     private static async Task AssertExactJsonErrorAsync(HttpResponseMessage response, string message)

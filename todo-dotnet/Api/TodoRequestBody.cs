@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 
 internal static class TodoRequestBody
 {
@@ -7,9 +8,14 @@ internal static class TodoRequestBody
 
     private static readonly JsonSerializerOptions StrictOptions = new()
     {
-        PropertyNameCaseInsensitive = false,
+        // Go's encoding/json matches field names case-insensitively.
+        PropertyNameCaseInsensitive = true,
         UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
     };
+
+    private static readonly Regex UnmappedPropertyName = new(
+        "['\"](?<name>[^'\"]+)['\"] could not be mapped|JSON property '(?<name>[^']+)'",
+        RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     /// <summary>
     /// Reads at most <see cref="MaxBodyBytes"/> + 1 bytes (even without Content-Length).
@@ -73,8 +79,18 @@ internal static class TodoRequestBody
                     "invalid JSON: expected an object or null"));
             }
 
-            if (reader.Read())
+            try
             {
+                if (reader.Read())
+                {
+                    return (null, JsonError.Write(
+                        StatusCodes.Status400BadRequest,
+                        "invalid JSON: unexpected data after the JSON object"));
+                }
+            }
+            catch (JsonException)
+            {
+                // Trailing junk that fails to tokenize still matches Go's trailing-data rejection.
                 return (null, JsonError.Write(
                     StatusCodes.Status400BadRequest,
                     "invalid JSON: unexpected data after the JSON object"));
@@ -92,14 +108,17 @@ internal static class TodoRequestBody
 
     private static string JsonProblem(JsonException ex)
     {
-        if (ex.Message.Contains("not been mapped", StringComparison.OrdinalIgnoreCase)
-            || ex.Message.Contains("Unmapped member", StringComparison.OrdinalIgnoreCase)
-            || ex.Message.Contains("extensible", StringComparison.OrdinalIgnoreCase))
+        if (IsUnmappedMember(ex))
         {
-            return ex.Message;
+            var name = ExtractUnmappedName(ex) ?? "unknown";
+            return $"json: unknown field \"{name}\"";
         }
 
-        if (ex.Path is { Length: > 0 })
+        if (ex.Path is { Length: > 0 }
+            && (ex.Message.Contains("could not be converted", StringComparison.OrdinalIgnoreCase)
+                || ex.Message.Contains("wrong type", StringComparison.OrdinalIgnoreCase)
+                || ex.Message.Contains("Boolean", StringComparison.OrdinalIgnoreCase)
+                || ex.Message.Contains("Number", StringComparison.OrdinalIgnoreCase)))
         {
             var field = ex.Path.TrimStart('$', '.');
             if (field.Length > 0)
@@ -109,5 +128,28 @@ internal static class TodoRequestBody
         }
 
         return "syntax error";
+    }
+
+    private static bool IsUnmappedMember(JsonException ex) =>
+        ex.Message.Contains("not been mapped", StringComparison.OrdinalIgnoreCase)
+        || ex.Message.Contains("could not be mapped", StringComparison.OrdinalIgnoreCase)
+        || ex.Message.Contains("Unmapped member", StringComparison.OrdinalIgnoreCase)
+        || ex.Message.Contains("extensible", StringComparison.OrdinalIgnoreCase)
+        || ex.Message.Contains("cannot be mapped", StringComparison.OrdinalIgnoreCase);
+
+    private static string? ExtractUnmappedName(JsonException ex)
+    {
+        var match = UnmappedPropertyName.Match(ex.Message);
+        if (match.Success)
+        {
+            return match.Groups["name"].Value;
+        }
+
+        if (ex.Path is { Length: > 0 })
+        {
+            return ex.Path.TrimStart('$', '.');
+        }
+
+        return null;
     }
 }
