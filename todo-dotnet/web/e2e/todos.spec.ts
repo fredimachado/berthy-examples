@@ -54,9 +54,22 @@ test("PageReportsSourceVersionAndErrors", async ({ page }) => {
   await expect(page.locator("#source")).toHaveText("cache (Redis)");
   await expect(page.locator("#source")).toHaveClass(/hit/);
 
-  await expect(page.locator("#version")).toContainText("version");
-  // Replica is optional when the host has no identity; still render the badge.
-  await expect(page.locator("#replica")).toBeVisible();
+  const versionRes = await page.request.get("/version");
+  expect(versionRes.ok()).toBeTruthy();
+  const versionDoc = (await versionRes.json()) as {
+    version: string;
+    commit: string;
+    replica?: string;
+  };
+  const shortCommit = versionDoc.commit.slice(0, 7);
+  await expect(page.locator("#version")).toHaveText(
+    `version ${versionDoc.version} (${shortCommit})`,
+  );
+  if (typeof versionDoc.replica === "string" && versionDoc.replica.length > 0) {
+    await expect(page.locator("#replica")).toHaveText(versionDoc.replica);
+  } else {
+    await expect(page.locator("#replica")).toHaveText("...");
+  }
 
   // Validation error must stay visible and keep the existing list.
   await page.getByPlaceholder("What needs doing?").fill("   ");
@@ -68,6 +81,46 @@ test("PageReportsSourceVersionAndErrors", async ({ page }) => {
 
   await page.locator("li", { hasText: title }).getByRole("button", { name: "Delete" }).click();
   await expect(page.locator("li", { hasText: title })).toHaveCount(0);
+});
+
+test("AddClearsDraftOnlyWhenUnchanged", async ({ page }) => {
+  const submitted = `draft-a-${Date.now()}`;
+  const newer = `draft-b-${Date.now()}`;
+
+  let releasePost!: () => void;
+  const postGate = new Promise<void>((resolve) => {
+    releasePost = resolve;
+  });
+  let signalPostStarted!: () => void;
+  const postStarted = new Promise<void>((resolve) => {
+    signalPostStarted = resolve;
+  });
+
+  await page.route(/\/api\/todos\/?$/, async (route) => {
+    if (route.request().method() === "POST") {
+      signalPostStarted();
+      await postGate;
+      await route.continue();
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto("/");
+  await waitForListReady(page);
+
+  await page.getByPlaceholder("What needs doing?").fill(submitted);
+  await page.getByRole("button", { name: "Add" }).click();
+  await postStarted;
+
+  await page.getByPlaceholder("What needs doing?").fill(newer);
+  releasePost();
+
+  await expect(page.locator("li", { hasText: submitted })).toBeVisible();
+  await expect(page.getByPlaceholder("What needs doing?")).toHaveValue(newer);
+
+  await page.locator("li", { hasText: submitted }).getByRole("button", { name: "Delete" }).click();
+  await expect(page.locator("li", { hasText: submitted })).toHaveCount(0);
 });
 
 test("LargeIdsAddressTheCorrectRow", async ({ page }) => {

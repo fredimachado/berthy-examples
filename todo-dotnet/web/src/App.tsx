@@ -91,7 +91,8 @@ export default function App() {
     const value = title;
     void act(async () => {
       await addTodo(value);
-      setTitle("");
+      // Clear only if the draft is still the submitted title (do not wipe a newer draft).
+      setTitle((current) => (current === value ? "" : current));
     });
   }
 
@@ -126,9 +127,10 @@ export default function App() {
         {error}
       </div>
       <ul id="list">
-        {items.length === 0 ? (
+        {list.status === "ok" && list.items.length === 0 ? (
           <li className="empty">Nothing to do.</li>
-        ) : (
+        ) : null}
+        {(list.status === "ok" || list.status === "error") &&
           items.map((t) => (
             <li key={t.id} className={t.done ? "done" : undefined}>
               <input
@@ -150,8 +152,7 @@ export default function App() {
                 Delete
               </button>
             </li>
-          ))
-        )}
+          ))}
       </ul>
       <div className="meta">
         <span>

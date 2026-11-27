@@ -119,6 +119,9 @@ try {
         $webUrl = Get-ResourceHttpUrl -Apphost $todoAppHost -DisplayName 'web'
         Write-Host "Web http endpoint: $webUrl"
 
+        # Scope TODO_BASE_URL to this run; restore the caller's value afterward.
+        $hadTodoBaseUrl = Test-Path Env:TODO_BASE_URL
+        $previousTodoBaseUrl = if ($hadTodoBaseUrl) { $env:TODO_BASE_URL } else { $null }
         $env:TODO_BASE_URL = $webUrl
         Push-Location $webDir
         try {
@@ -129,7 +132,12 @@ try {
         }
         finally {
             Pop-Location
-            Remove-Item Env:TODO_BASE_URL -ErrorAction SilentlyContinue
+            if ($hadTodoBaseUrl) {
+                $env:TODO_BASE_URL = $previousTodoBaseUrl
+            }
+            else {
+                Remove-Item Env:TODO_BASE_URL -ErrorAction SilentlyContinue
+            }
         }
     }
 }
