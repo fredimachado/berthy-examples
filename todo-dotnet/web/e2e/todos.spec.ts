@@ -16,6 +16,7 @@ test("UserCanManageATodo", async ({ page }) => {
 
   const row = page.locator("li", { hasText: title });
   await expect(row).toBeVisible();
+  await expect(page.getByPlaceholder("What needs doing?")).toHaveValue("");
   await expect(row.locator('input[type="checkbox"]')).not.toBeChecked();
 
   await row.locator('input[type="checkbox"]').click();
@@ -81,6 +82,60 @@ test("PageReportsSourceVersionAndErrors", async ({ page }) => {
 
   await page.locator("li", { hasText: title }).getByRole("button", { name: "Delete" }).click();
   await expect(page.locator("li", { hasText: title })).toHaveCount(0);
+});
+
+test("EmptyListMessageOnlyAfterSuccessfulEmptyGet", async ({ page }) => {
+  type GetOutcome = "hold" | "fail" | "empty";
+  let outcome: GetOutcome = "hold";
+  let releaseHold!: () => void;
+  const hold = new Promise<void>((resolve) => {
+    releaseHold = resolve;
+  });
+
+  await page.route(/\/api\/todos\/?$/, async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.continue();
+      return;
+    }
+    if (outcome === "hold") {
+      await hold;
+    }
+    if (outcome === "fail") {
+      await route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "internal error" }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: { "X-Cache": "miss" },
+      body: "[]",
+    });
+  });
+
+  await page.route("**/version", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ version: "dev", commit: "unknown" }),
+    });
+  });
+
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Todo" })).toBeVisible();
+  await expect(page.locator("#list .empty")).toHaveCount(0);
+
+  outcome = "fail";
+  releaseHold();
+  await expect(page.locator("#error")).toContainText("internal error");
+  await expect(page.locator("#list .empty")).toHaveCount(0);
+
+  outcome = "empty";
+  await page.reload();
+  await expect(page.locator("#list .empty")).toHaveText("Nothing to do.");
 });
 
 test("AddClearsDraftOnlyWhenUnchanged", async ({ page }) => {

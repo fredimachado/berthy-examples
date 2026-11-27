@@ -119,19 +119,18 @@ try {
         $webUrl = Get-ResourceHttpUrl -Apphost $todoAppHost -DisplayName 'web'
         Write-Host "Web http endpoint: $webUrl"
 
-        # Scope TODO_BASE_URL to this run; restore the caller's value afterward.
+        # Scope TODO_BASE_URL to this try; restore the caller's value in finally.
+        # Do not Push-Location: npm uses --prefix, and a failed cd would leave the temp URL set.
         $hadTodoBaseUrl = Test-Path Env:TODO_BASE_URL
         $previousTodoBaseUrl = if ($hadTodoBaseUrl) { $env:TODO_BASE_URL } else { $null }
-        $env:TODO_BASE_URL = $webUrl
-        Push-Location $webDir
         try {
+            $env:TODO_BASE_URL = $webUrl
             npm --prefix $webDir run test:e2e
             if ($LASTEXITCODE -ne 0) {
                 throw "npm run test:e2e failed with exit code $LASTEXITCODE"
             }
         }
         finally {
-            Pop-Location
             if ($hadTodoBaseUrl) {
                 $env:TODO_BASE_URL = $previousTodoBaseUrl
             }
