@@ -1,0 +1,9 @@
+**/bin/
+**/obj/
+**/node_modules/
+**/dist/
+**/.vs/
+**/.aspire/
+**/TestResults/
+**/*.user
+**/.DS_Store

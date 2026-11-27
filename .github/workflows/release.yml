@@ -1,8 +1,9 @@
 name: Release
 
 # Every push to main that passes the checks publishes a version, v1.0.<run number>:
-# the image ghcr.io/fredimachado/todo-api, a git tag on the built commit and a
-# GitHub release whose notes carry the image digest and the deploy commands.
+# the images ghcr.io/fredimachado/todo-api and
+# ghcr.io/fredimachado/todo-dotnet-api, a git tag on the built commit and a
+# GitHub release whose notes carry the image digests and the deploy commands.
 # On a protected environment the agent admits that digest; paste the digest
 # command in CI or other automation. At a terminal a human admin may resolve
 # a tag to one instead.
@@ -33,6 +34,7 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/fredimachado/todo-api
+  IMAGE_DOTNET: ghcr.io/fredimachado/todo-dotnet-api
   VERSION: v1.0.${{ github.run_number }}
 
 jobs:
@@ -77,11 +79,16 @@ jobs:
             echo "$IMAGE:latest"
             echo "$IMAGE:sha-$short"
             echo "EOF"
+            echo "list_dotnet<<EOF"
+            echo "$IMAGE_DOTNET:$VERSION"
+            echo "$IMAGE_DOTNET:latest"
+            echo "$IMAGE_DOTNET:sha-$short"
+            echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      # The image is cross-compiled by the Dockerfile, so arm64 needs no emulation.
-      # No provenance attestation: the digest then names an index of exactly two images.
-      - name: Build and push the image
+      # Images are cross-compiled by their Dockerfiles, so arm64 needs no emulation.
+      # No provenance attestation: each digest then names an index of exactly two images.
+      - name: Build and push the Go image
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -94,27 +101,49 @@ jobs:
             VERSION=${{ env.VERSION }}
             COMMIT=${{ github.sha }}
 
+      - name: Build and push the .NET image
+        id: build_dotnet
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: todo-dotnet
+          file: todo-dotnet/Api/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ steps.tags.outputs.list_dotnet }}
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            COMMIT=${{ github.sha }}
+
       # Check what was pushed, by digest, the way Berthy will pull it.
-      - name: Check the pushed image
+      - name: Check the pushed images
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST_DOTNET: ${{ steps.build_dotnet.outputs.digest }}
         run: |
           printf '%s\n' "$DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          printf '%s\n' "$DIGEST_DOTNET" | grep -Eq '^sha256:[0-9a-f]{64}$'
           docker buildx imagetools inspect "$IMAGE@$DIGEST" | tee inspect.txt
           grep -q "linux/amd64" inspect.txt
           grep -q "linux/arm64" inspect.txt
           docker run --rm "$IMAGE@$DIGEST" /app/bin/todo-api version | tee version.txt
           grep -q "^$VERSION $GITHUB_SHA$" version.txt
+          docker buildx imagetools inspect "$IMAGE_DOTNET@$DIGEST_DOTNET" | tee inspect-dotnet.txt
+          grep -q "linux/amd64" inspect-dotnet.txt
+          grep -q "linux/arm64" inspect-dotnet.txt
+          docker run --rm "$IMAGE_DOTNET@$DIGEST_DOTNET" version | tee version-dotnet.txt
+          grep -q "^$VERSION $GITHUB_SHA$" version-dotnet.txt
 
       - name: Write the release notes
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST_DOTNET: ${{ steps.build_dotnet.outputs.digest }}
         run: |
           short=$(git rev-parse --short=7 HEAD)
           cat > notes.md <<EOF
-          Todo API \`$VERSION\`, built from commit \`$GITHUB_SHA\`.
+          Todo APIs \`$VERSION\`, built from commit \`$GITHUB_SHA\`.
 
-          ## Image
+          ## Go image
 
           \`\`\`
           $IMAGE:$VERSION
@@ -125,7 +154,18 @@ jobs:
 
           Digest: \`$DIGEST\` (linux/amd64 and linux/arm64)
 
-          ## Deploy with Berthy
+          ## .NET image
+
+          \`\`\`
+          $IMAGE_DOTNET:$VERSION
+          $IMAGE_DOTNET:latest
+          $IMAGE_DOTNET:sha-$short
+          $IMAGE_DOTNET@$DIGEST_DOTNET
+          \`\`\`
+
+          Digest: \`$DIGEST_DOTNET\` (linux/amd64 and linux/arm64)
+
+          ## Deploy with Berthy (Go)
 
           Run these from \`todo/berthy\`, so the manifest selects the project.
 
@@ -151,6 +191,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST_DOTNET: ${{ steps.build_dotnet.outputs.digest }}
         run: |
           if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             # A re-run of this workflow run: the release exists, so update its notes.
@@ -159,4 +200,4 @@ jobs:
             gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" --title "$VERSION" --notes-file notes.md
           fi
-          echo "Published $VERSION: $IMAGE@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          echo "Published $VERSION: $IMAGE@$DIGEST and $IMAGE_DOTNET@$DIGEST_DOTNET" >> "$GITHUB_STEP_SUMMARY"

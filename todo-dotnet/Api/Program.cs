@@ -4,6 +4,16 @@ using System.Text.Json.Serialization;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.FileProviders;
 
+if (args is ["version"])
+{
+    var versionConfig = new ConfigurationBuilder()
+        .AddEnvironmentVariables()
+        .Build();
+    var info = BuildInfo.ReadBuildInfo(versionConfig, hostName: null);
+    Console.WriteLine($"{info.Version} {info.Commit}");
+    return 0;
+}
+
 if (args is ["migrate"])
 {
     var migrateConfig = new ConfigurationBuilder()

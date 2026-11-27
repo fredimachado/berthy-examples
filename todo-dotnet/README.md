@@ -10,7 +10,7 @@ still deploys the Go `todo/` app).
 
 ```
 todo-dotnet/
-  Api/                 ASP.NET Core 11 API, EF Core migrations, published wwwroot
+  Api/                 ASP.NET Core 11 API, EF Core migrations, Dockerfile, published wwwroot
   AppHost/             Scoped C# Aspire AppHost (Postgres, Redis, migrate, api, web)
   Tests/               xUnit contract and integration tests
   web/                 React + Vite SPA and Playwright suite
@@ -123,11 +123,26 @@ Ordinary `dotnet build` / `dotnet test` do not require Node or browsers. The
 frontend install and Vite build run at `dotnet publish` time (or via the npm
 commands above).
 
-## Releases and the Go image
+## Docker image and releases
 
-Pushes to `main` that change non-Markdown files still run the repository
-[release workflow](../.github/workflows/release.yml), which publishes the Go
-`todo-api` image. A .NET-only change can therefore trigger a Go image release.
-Restricting that trigger is a separate decision. The
-[todo-dotnet workflow](../.github/workflows/todo-dotnet.yml) covers this example
-on its own paths.
+The API image is `ghcr.io/fredimachado/todo-dotnet-api`. Its
+[Dockerfile](Api/Dockerfile) publishes the API with the Vite SPA in `wwwroot`,
+runs as UID `1654` (`APP_UID` in the aspnet image), and exposes port `8080`.
+
+Useful commands (the image entrypoint is `dotnet Todo.Api.dll`):
+
+| Command | What it does |
+| --- | --- |
+| *(default)* | Serve the API and SPA. |
+| `version` | Print `BuildVersion` and `BuildCommit` (set at image build time). |
+| `migrate` | Apply EF Core migrations. Needs `ConnectionStrings__tododb`. |
+
+The [todo-dotnet workflow](../.github/workflows/todo-dotnet.yml) builds the
+image for `linux/amd64` and `linux/arm64` and smoke-tests `version`, `migrate`
+without a connection string, and the non-root user.
+
+Pushes to `main` that change non-Markdown files run the repository
+[release workflow](../.github/workflows/release.yml), which publishes both the
+Go `todo-api` image and this .NET image as `v1.0.N`. A .NET-only change can
+therefore also publish a new Go image (and the reverse). Restricting that
+trigger is a separate decision.
