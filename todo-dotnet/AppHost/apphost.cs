@@ -55,6 +55,6 @@ builder.AddDotnetProject("api", "../Api/Todo.Api.csproj")
     .WithReference(redis)
     .WaitForCompletion(migrate)
     .WaitFor(redis)
-    .WithHttpHealthCheck("/version");
+    .WithHttpHealthCheck("/health");
 
 builder.Build().Run();

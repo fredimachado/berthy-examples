@@ -102,6 +102,14 @@ app.Use(async (context, next) =>
         return;
     }
 
+    if (path is not null
+        && path.Equals("/health", StringComparison.OrdinalIgnoreCase)
+        && !string.Equals(path, "/health", StringComparison.Ordinal))
+    {
+        await JsonError.Write(StatusCodes.Status404NotFound, "not found").ExecuteAsync(context);
+        return;
+    }
+
     await next();
 });
 
@@ -119,6 +127,41 @@ if (!string.IsNullOrWhiteSpace(tododb))
     app.MapPost("/api/todos", TodoCommands.CreateTodoAsync);
     app.MapMethods("/api/todos/{id}", ["PATCH"], TodoCommands.PatchTodoAsync);
     app.MapDelete("/api/todos/{id}", TodoCommands.DeleteTodoAsync);
+
+    app.MapGet("/health", async (TodoDbContext db, IServiceProvider sp, CancellationToken ct) =>
+    {
+        var mux = sp.GetService<IConnectionMultiplexer>();
+        var probes = new DependencyProbe[]
+        {
+            new("postgres", async token =>
+            {
+                await db.Database.ExecuteSqlRawAsync("SELECT 1", token);
+            }),
+            new("redis", async token =>
+            {
+                if (mux is null)
+                {
+                    throw new InvalidOperationException("redis is not configured");
+                }
+
+                // PingAsync ignores cancellation; the shared WaitAsync deadline still bounds the wait.
+                token.ThrowIfCancellationRequested();
+                await mux.GetDatabase().PingAsync();
+                token.ThrowIfCancellationRequested();
+            }),
+        };
+
+        var failed = await DependencyHealth.FailedDependenciesAsync(probes, TimeProvider.System, ct);
+        if (failed.Length == 0)
+        {
+            return Results.Json(new HealthOkResponse("ok"), AppJson.Options);
+        }
+
+        return Results.Json(
+            new HealthUnavailableResponse("unavailable", failed),
+            AppJson.Options,
+            statusCode: StatusCodes.Status503ServiceUnavailable);
+    });
 }
 
 app.MapFallback(() => JsonError.Write(StatusCodes.Status404NotFound, "not found"));
@@ -163,5 +206,8 @@ file sealed class CachedListResult(byte[] bytes, bool cacheHit) : IResult
         await response.Body.WriteAsync(bytes);
     }
 }
+
+file sealed record HealthOkResponse(string Status);
+file sealed record HealthUnavailableResponse(string Status, string[] Failed);
 
 public partial class Program;
