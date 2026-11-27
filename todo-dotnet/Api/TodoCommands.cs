@@ -170,8 +170,39 @@ internal static class TodoCommands
         }
     }
 
-    internal static bool TryParsePositiveId(string id, out long value) =>
-        long.TryParse(id, NumberStyles.Integer, CultureInfo.InvariantCulture, out value) && value >= 1;
+    /// <summary>
+    /// Matches Go <c>strconv.ParseInt(s, 10, 64)</c>: optional leading sign and ASCII digits only.
+    /// Rejects whitespace padding (e.g. path segment <c>%2042</c>).
+    /// </summary>
+    internal static bool TryParsePositiveId(string id, out long value)
+    {
+        value = 0;
+        if (id.Length == 0)
+        {
+            return false;
+        }
+
+        var i = 0;
+        if (id[0] is '+' or '-')
+        {
+            i = 1;
+            if (id.Length == 1)
+            {
+                return false;
+            }
+        }
+
+        for (; i < id.Length; i++)
+        {
+            if (id[i] is < '0' or > '9')
+            {
+                return false;
+            }
+        }
+
+        return long.TryParse(id, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out value)
+            && value >= 1;
+    }
 
     private static DateTimeOffset TruncateToMicroseconds(DateTimeOffset value)
     {

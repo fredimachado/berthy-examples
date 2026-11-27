@@ -6,67 +6,35 @@ internal static class TodoRequestBody
 {
     internal const int MaxBodyBytes = 8192;
 
+    private delegate (T? Body, IResult? Error) ObjectReader<T>(ref Utf8JsonReader reader);
+
     /// <summary>
     /// Reads at most <see cref="MaxBodyBytes"/> + 1 bytes (even without Content-Length).
     /// Accepts one JSON object or the literal null, then optional whitespace.
     /// Top-level null supplies an empty input record.
     /// </summary>
-    internal static async Task<(CreateTodoBody? Body, IResult? Error)> ReadCreateAsync(
+    internal static Task<(CreateTodoBody? Body, IResult? Error)> ReadCreateAsync(
         HttpRequest request,
-        CancellationToken ct)
-    {
-        var (buffer, total, error) = await ReadBodyBytesAsync(request, ct);
-        if (error is not null)
-        {
-            return (null, error);
-        }
-
-        try
-        {
-            var reader = new Utf8JsonReader(buffer.AsSpan(0, total));
-            if (!reader.Read())
-            {
-                return (null, JsonError.Write(StatusCodes.Status400BadRequest, "invalid JSON: the body is empty"));
-            }
-
-            CreateTodoBody body;
-            if (reader.TokenType == JsonTokenType.Null)
-            {
-                body = new CreateTodoBody(null);
-            }
-            else if (reader.TokenType == JsonTokenType.StartObject)
-            {
-                var (parsed, parseError) = ReadCreateObject(ref reader);
-                if (parseError is not null)
-                {
-                    return (null, parseError);
-                }
-
-                body = parsed!;
-            }
-            else
-            {
-                return (null, JsonError.Write(
-                    StatusCodes.Status400BadRequest,
-                    "invalid JSON: expected an object or null"));
-            }
-
-            return FinishObjectOrNull(ref reader, body);
-        }
-        catch (JsonException)
-        {
-            return (null, JsonError.Write(
-                StatusCodes.Status400BadRequest,
-                "invalid JSON: syntax error"));
-        }
-    }
+        CancellationToken ct) =>
+        ReadTopLevelAsync(request, ReadCreateObject, static () => new CreateTodoBody(null), ct);
 
     /// <summary>
-    /// Same body rules as create. Omitted or JSON-null members stay null (leave field alone).
+    /// Same top-level body rules as create. Field rules differ: omitted/null members stay null.
     /// </summary>
-    internal static async Task<(PatchTodoBody? Body, IResult? Error)> ReadPatchAsync(
+    internal static Task<(PatchTodoBody? Body, IResult? Error)> ReadPatchAsync(
         HttpRequest request,
+        CancellationToken ct) =>
+        ReadTopLevelAsync(request, ReadPatchObject, static () => new PatchTodoBody(null, null), ct);
+
+    /// <summary>
+    /// Shared object-or-null envelope for create and patch; <paramref name="readObject"/> owns fields.
+    /// </summary>
+    private static async Task<(T? Body, IResult? Error)> ReadTopLevelAsync<T>(
+        HttpRequest request,
+        ObjectReader<T> readObject,
+        Func<T> emptyFromNull,
         CancellationToken ct)
+        where T : class
     {
         var (buffer, total, error) = await ReadBodyBytesAsync(request, ct);
         if (error is not null)
@@ -82,14 +50,14 @@ internal static class TodoRequestBody
                 return (null, JsonError.Write(StatusCodes.Status400BadRequest, "invalid JSON: the body is empty"));
             }
 
-            PatchTodoBody body;
+            T body;
             if (reader.TokenType == JsonTokenType.Null)
             {
-                body = new PatchTodoBody(null, null);
+                body = emptyFromNull();
             }
             else if (reader.TokenType == JsonTokenType.StartObject)
             {
-                var (parsed, parseError) = ReadPatchObject(ref reader);
+                var (parsed, parseError) = readObject(ref reader);
                 if (parseError is not null)
                 {
                     return (null, parseError);

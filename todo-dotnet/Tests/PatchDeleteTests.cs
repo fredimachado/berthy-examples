@@ -260,6 +260,44 @@ public sealed class PatchDeleteTests
     }
 
     [Fact]
+    public async Task PaddedIdRejectedOnPatchAndDelete()
+    {
+        // Go strconv.ParseInt rejects whitespace; "%2042" must not become id 42.
+        await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
+        Assert.Equal(0, (await MigrateProcess.RunAsync(database.ConnectionString)).ExitCode);
+
+        var seedId = await SeedTodoAsync(
+            database.ConnectionString,
+            title: "pad-target",
+            done: false,
+            createdAt: new DateTimeOffset(2022, 3, 3, 0, 0, 0, TimeSpan.Zero),
+            updatedAt: new DateTimeOffset(2022, 3, 3, 0, 0, 0, TimeSpan.Zero));
+
+        await using var factory = CreateFactory(database.ConnectionString, replica: "");
+        var client = factory.CreateClient();
+        var before = await ReadTodoAsync(database.ConnectionString, seedId);
+
+        var padded = $"%20{seedId}";
+        using (var patch = await PatchJsonAsync(client, $"/api/todos/{padded}", """{"done":true}"""))
+        {
+            Assert.Equal(HttpStatusCode.BadRequest, patch.StatusCode);
+            await AssertExactJsonErrorAsync(patch, "id must be a positive number");
+        }
+
+        using (var delete = await client.DeleteAsync($"/api/todos/{padded}"))
+        {
+            Assert.Equal(HttpStatusCode.BadRequest, delete.StatusCode);
+            await AssertExactJsonErrorAsync(delete, "id must be a positive number");
+        }
+
+        var after = await ReadTodoAsync(database.ConnectionString, seedId);
+        Assert.Equal(before.Title, after.Title);
+        Assert.Equal(before.Done, after.Done);
+        Assert.Equal(before.UpdatedAt, after.UpdatedAt);
+        Assert.Equal(1, await CountTodosAsync(database.ConnectionString));
+    }
+
+    [Fact]
     public async Task DeleteRemovesExactlyOneRow()
     {
         await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
