@@ -1,0 +1,116 @@
+:root {
+  color-scheme: light dark;
+  --accent: #2563eb;
+  --muted: #6b7280;
+  --line: #d1d5db;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font: 16px/1.5 system-ui, sans-serif;
+  max-width: 34rem;
+  margin: 2rem auto;
+  padding: 0 1rem;
+}
+
+h1 {
+  margin: 0 0 1rem;
+  font-size: 1.6rem;
+}
+
+form {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+input[type="text"] {
+  flex: 1;
+  padding: 0.5rem;
+  font: inherit;
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  background: transparent;
+  color: inherit;
+}
+
+button {
+  font: inherit;
+  padding: 0.5rem 0.9rem;
+  border: 0;
+  border-radius: 0.4rem;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+
+button.link {
+  background: none;
+  color: var(--muted);
+  padding: 0.25rem 0.5rem;
+}
+
+button.link:hover {
+  color: #dc2626;
+}
+
+ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+li {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--line);
+}
+
+li span {
+  flex: 1;
+  word-break: break-word;
+}
+
+li.done span {
+  text-decoration: line-through;
+  color: var(--muted);
+}
+
+.meta {
+  margin-top: 1rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+  display: flex;
+  justify-content: space-between;
+}
+
+.badge {
+  padding: 0.05rem 0.5rem;
+  border-radius: 1rem;
+  border: 1px solid var(--line);
+}
+
+.badge.hit {
+  color: #15803d;
+  border-color: #15803d;
+}
+
+.badge.miss {
+  color: #b45309;
+  border-color: #b45309;
+}
+
+#error {
+  color: #dc2626;
+  min-height: 1.5rem;
+}
+
+.empty {
+  color: var(--muted);
+  padding: 0.5rem 0;
+}
