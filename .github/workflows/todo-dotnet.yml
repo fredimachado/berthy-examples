@@ -1,0 +1,90 @@
+name: todo-dotnet
+
+on:
+  push:
+    paths:
+      - 'todo-dotnet/**'
+      - '.github/workflows/todo-dotnet.yml'
+  pull_request:
+    paths:
+      - 'todo-dotnet/**'
+      - '.github/workflows/todo-dotnet.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: todo-dotnet-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: Test, AspireWeb, PublishedWeb
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@d4c94342e560b34958eacfc5d055d21461ed1c5d # v5.0.0
+        with:
+          dotnet-version: '11.0.x'
+
+      - name: Set up Node
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: todo-dotnet/web/package-lock.json
+
+      - name: Install Aspire CLI
+        run: |
+          dotnet tool install -g Aspire.Cli --version 17.0.0
+          echo "$HOME/.dotnet/tools" | Out-File -FilePath $env:GITHUB_PATH -Append
+          aspire --version
+
+      - name: .NET tests
+        run: |
+          dotnet test todo-dotnet/Tests/Todo.Tests.csproj --configuration Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Frontend install and build
+        run: |
+          npm --prefix todo-dotnet/web ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm --prefix todo-dotnet/web run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install Playwright Chromium
+        run: |
+          Push-Location todo-dotnet/web
+          try {
+            npx --no-install playwright install --with-deps chromium
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          finally {
+            Pop-Location
+          }
+
+      - name: AspireWeb
+        run: |
+          pwsh -NoProfile -File todo-dotnet/scripts/verify.ps1 -Target AspireWeb
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Publish API with SPA
+        run: |
+          $todoPublishDir = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+          Write-Host "PublishDir=$todoPublishDir"
+          echo "TODO_PUBLISH_DIR=$todoPublishDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          dotnet publish todo-dotnet/Api/Todo.Api.csproj --configuration Release --output $todoPublishDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: PublishedWeb
+        run: |
+          pwsh -NoProfile -File todo-dotnet/scripts/verify.ps1 -Target PublishedWeb -PublishDir $env:TODO_PUBLISH_DIR
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

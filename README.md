@@ -7,6 +7,7 @@ Docker image.
 | Example | What it is |
 | --- | --- |
 | [`todo/`](todo/README.md) | A todo list: a Go API with Postgres and Redis. It is the app the Berthy [user guide](https://github.com/fredimachado/berthy/blob/main/docs/user-guide.md) deploys. Run it locally with Docker Compose, deploy it with Berthy, ship new versions from GitHub Actions. |
+| [`todo-dotnet/`](todo-dotnet/README.md) | The same todo list as an Aspire-first ASP.NET Core API with Postgres, Redis, and a React SPA. Run it locally with Aspire; publish one directory that serves the API and static site. |
 
 ## How the repository is built and released
 
