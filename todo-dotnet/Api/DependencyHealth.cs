@@ -15,7 +15,8 @@ internal static class DependencyHealth
     internal static async Task<string[]> FailedDependenciesAsync(
         IReadOnlyList<DependencyProbe> probes, TimeProvider clock, CancellationToken ct)
     {
-        // Start the shared deadline before any probe work so cold connects cannot steal budget.
+        // Shared start for elapsed checks at success-record time (CAS alone is not enough).
+        var startedAt = clock.GetTimestamp();
         var deadlineTask = Task.Delay(Deadline, clock, ct);
 
         var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -26,7 +27,7 @@ internal static class DependencyHealth
             var index = i;
             var probe = probes[i];
             // Probes run independently of the response wait; only the deadline gates the reply.
-            tasks[i] = ProbeAsync(probe, linked.Token, outcomes, index);
+            tasks[i] = ProbeAsync(probe, linked.Token, outcomes, index, clock, startedAt);
         }
 
         var probeTask = Task.WhenAll(tasks);
@@ -34,7 +35,6 @@ internal static class DependencyHealth
 
         if (completed == deadlineTask)
         {
-            // Pending → failed. Late success cannot overwrite a timeout (CAS from Pending only).
             for (var i = 0; i < outcomes.Length; i++)
             {
                 Interlocked.CompareExchange(ref outcomes[i], Failed, Pending);
@@ -72,17 +72,34 @@ internal static class DependencyHealth
         DependencyProbe probe,
         CancellationToken ct,
         int[] outcomes,
-        int index)
+        int index,
+        TimeProvider clock,
+        long startedAt)
     {
         try
         {
             await probe.CheckAsync(ct);
-            Interlocked.CompareExchange(ref outcomes[index], SucceededInBudget, Pending);
+            TryRecordSuccess(outcomes, index, clock, startedAt);
         }
         catch (Exception)
         {
             Interlocked.CompareExchange(ref outcomes[index], Failed, Pending);
         }
+    }
+
+    /// <summary>
+    /// Success counts only when recorded before the shared deadline elapses.
+    /// </summary>
+    private static void TryRecordSuccess(
+        int[] outcomes, int index, TimeProvider clock, long startedAt)
+    {
+        if (clock.GetElapsedTime(startedAt) >= Deadline)
+        {
+            Interlocked.CompareExchange(ref outcomes[index], Failed, Pending);
+            return;
+        }
+
+        Interlocked.CompareExchange(ref outcomes[index], SucceededInBudget, Pending);
     }
 
     private static Task CleanupAfterDeadlineAsync(CancellationTokenSource cts, Task[] tasks) =>

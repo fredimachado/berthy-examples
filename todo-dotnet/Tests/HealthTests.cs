@@ -164,30 +164,30 @@ public sealed class HealthTests
     public async Task HealthLateSuccessAfterDeadlineStillReportsFailed()
     {
         var clock = new FakeTimeProvider();
-        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var finish = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var redisRecorded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        async Task SucceedAfterBudgetAsync(CancellationToken ct)
+        async Task RedisOkFirstAsync(CancellationToken ct)
         {
-            entered.TrySetResult();
-            // Ignore cancellation so a late success can race the deadline classification.
-            await finish.Task;
+            await Task.CompletedTask;
+            redisRecorded.TrySetResult();
+        }
+
+        async Task AdvancePastDeadlineThenSucceedAsync(CancellationToken ct)
+        {
+            // Let redis record an in-budget success first; then advance inside this probe.
+            await redisRecorded.Task.WaitAsync(ct);
+            clock.Advance(TimeSpan.FromSeconds(2));
+            await Task.CompletedTask;
         }
 
         var probes = new DependencyProbe[]
         {
-            new("postgres", SucceedAfterBudgetAsync),
-            new("redis", async _ => await Task.CompletedTask),
+            new("postgres", AdvancePastDeadlineThenSucceedAsync),
+            new("redis", RedisOkFirstAsync),
         };
 
-        var healthTask = DependencyHealth.FailedDependenciesAsync(probes, clock, CancellationToken.None);
-        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-
-        clock.Advance(TimeSpan.FromSeconds(2));
-        // Complete successfully after the budget expired — must not clear the timeout failure.
-        finish.TrySetResult();
-
-        var failed = await healthTask.WaitAsync(TimeSpan.FromSeconds(5));
+        var failed = await DependencyHealth.FailedDependenciesAsync(
+            probes, clock, CancellationToken.None);
         Assert.Equal(new[] { "postgres" }, failed);
     }
 
@@ -245,6 +245,17 @@ public sealed class HealthTests
         }
         finally
         {
+            // Stop listener and await accept loop before disposing retained clients.
+            listener.Stop();
+            try
+            {
+                await acceptLoop.WaitAsync(TimeSpan.FromSeconds(2));
+            }
+            catch (Exception)
+            {
+                // Listener stopped; accept loop may fault.
+            }
+
             TcpClient[] snapshot;
             lock (heldClients)
             {
@@ -255,16 +266,6 @@ public sealed class HealthTests
             foreach (var held in snapshot)
             {
                 held.Dispose();
-            }
-
-            listener.Stop();
-            try
-            {
-                await acceptLoop.WaitAsync(TimeSpan.FromSeconds(1));
-            }
-            catch (Exception)
-            {
-                // Listener stopped; accept loop may fault.
             }
         }
     }

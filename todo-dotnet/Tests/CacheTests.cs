@@ -259,6 +259,34 @@ public sealed class CacheTests
     }
 
     [Fact]
+    public async Task InvalidateIgnoresRequestCancellationDuringAcquisition()
+    {
+        await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
+        Assert.Equal(0, (await MigrateProcess.RunAsync(database.ConnectionString)).ExitCode);
+        await RedisAdmin.FlushListKeyAsync(_services.RedisConnectionString);
+
+        await using var factory = CreateFactory(database.ConnectionString);
+        var cache = factory.Services.GetRequiredService<TodoListCache>();
+
+        await RedisAdmin.SetListBytesAsync(_services.RedisConnectionString, "[]"u8.ToArray());
+        Assert.True((await RedisAdmin.ReadRawAsync(_services.RedisConnectionString)).HasValue);
+
+        using var requestCt = new CancellationTokenSource();
+        cache.BeforeInvalidateRedisAsync = () =>
+        {
+            // Simulate client disconnect while invalidation is acquiring Redis.
+            requestCt.Cancel();
+            return Task.CompletedTask;
+        };
+
+        await cache.InvalidateAsync(requestCt.Token);
+        cache.BeforeInvalidateRedisAsync = null;
+
+        var remaining = await RedisAdmin.ReadRawAsync(_services.RedisConnectionString);
+        Assert.False(remaining.HasValue);
+    }
+
+    [Fact]
     public async Task AnOlderFillCannotRestoreADeletedValue()
     {
         await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);

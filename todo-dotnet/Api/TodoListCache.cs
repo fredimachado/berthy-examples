@@ -38,6 +38,11 @@ internal sealed class TodoListCache
     /// </summary>
     internal Func<CancellationToken, Task>? AfterDatabaseReadAsync { get; set; }
 
+    /// <summary>
+    /// Test hook: runs at the start of invalidation Redis work (before connect/delete).
+    /// </summary>
+    internal Func<Task>? BeforeInvalidateRedisAsync { get; set; }
+
     internal async Task<TodoListResult> ListAsync(TodoDbContext db, CancellationToken ct)
     {
         var redis = await TryDatabaseAsync(ct);
@@ -134,16 +139,23 @@ internal sealed class TodoListCache
     }
 
     /// <summary>
-    /// Best-effort delete of the list key or fill token. Bounded and independent of
-    /// client disconnect so a committed write still attempts invalidation.
+    /// Best-effort delete of the list key or fill token. Uses an independent ~2s budget so
+    /// client disconnect after commit cannot skip invalidation. <paramref name="ct"/> is ignored.
     /// </summary>
     internal async Task InvalidateAsync(CancellationToken ct)
     {
+        _ = ct; // Request cancellation must not abort post-commit invalidation.
+
+        if (BeforeInvalidateRedisAsync is not null)
+        {
+            await BeforeInvalidateRedisAsync();
+        }
+
+        // One independent token for connect and delete — not linked to the request.
+        using var bound = new CancellationTokenSource(InvalidationTimeout);
         IDatabase? redis;
         try
         {
-            using var bound = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            bound.CancelAfter(InvalidationTimeout);
             redis = await TryDatabaseAsync(bound.Token);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -151,7 +163,7 @@ internal sealed class TodoListCache
             _logger.LogWarning(ex, "cache unavailable");
             return;
         }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
             _logger.LogWarning("cache invalidation timed out");
             return;
@@ -164,14 +176,13 @@ internal sealed class TodoListCache
 
         try
         {
-            using var bound = new CancellationTokenSource(InvalidationTimeout);
             await redis.KeyDeleteAsync(Key).WaitAsync(bound.Token);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogWarning(ex, "cache invalidation failed");
         }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
             _logger.LogWarning("cache invalidation timed out");
         }
