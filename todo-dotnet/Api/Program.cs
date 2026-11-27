@@ -52,7 +52,11 @@ if (!string.IsNullOrWhiteSpace(tododb))
         var todos = await TodoQueries.ReadTodosAsync(db, ct);
         return Results.Json(todos, AppJson.Options);
     });
+
+    app.MapPost("/api/todos", TodoCommands.CreateTodoAsync);
 }
+
+app.MapFallback(() => JsonError.Write(StatusCodes.Status404NotFound, "not found"));
 
 app.Run();
 return 0;
