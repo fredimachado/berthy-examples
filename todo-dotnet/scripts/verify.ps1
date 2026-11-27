@@ -307,23 +307,31 @@ function Invoke-PublishedWeb {
         Assert-NativeExit 'docker run redis'
 
         $readyDeadline = [DateTime]::UtcNow + [TimeSpan]::FromMinutes(2)
-        do {
-            docker exec $pgName pg_isready -U todo -d tododb | Out-Null
-            if ($LASTEXITCODE -eq 0) { break }
-            if ([DateTime]::UtcNow -ge $readyDeadline) {
-                throw "Postgres container $pgName did not become ready."
-            }
-            Start-Sleep -Milliseconds 500
-        } while ($true)
+        # Poll readiness without $PSNativeCommandUseErrorActionPreference aborting on not-ready exits.
+        $previousNative = $PSNativeCommandUseErrorActionPreference
+        $PSNativeCommandUseErrorActionPreference = $false
+        try {
+            do {
+                docker exec $pgName pg_isready -U todo -d tododb | Out-Null
+                if ($LASTEXITCODE -eq 0) { break }
+                if ([DateTime]::UtcNow -ge $readyDeadline) {
+                    throw "Postgres container $pgName did not become ready."
+                }
+                Start-Sleep -Milliseconds 500
+            } while ($true)
 
-        do {
-            docker exec $redisName redis-cli ping | Out-Null
-            if ($LASTEXITCODE -eq 0) { break }
-            if ([DateTime]::UtcNow -ge $readyDeadline) {
-                throw "Redis container $redisName did not become ready."
-            }
-            Start-Sleep -Milliseconds 500
-        } while ($true)
+            do {
+                docker exec $redisName redis-cli ping | Out-Null
+                if ($LASTEXITCODE -eq 0) { break }
+                if ([DateTime]::UtcNow -ge $readyDeadline) {
+                    throw "Redis container $redisName did not become ready."
+                }
+                Start-Sleep -Milliseconds 500
+            } while ($true)
+        }
+        finally {
+            $PSNativeCommandUseErrorActionPreference = $previousNative
+        }
 
         $tododb = "Host=127.0.0.1;Port=$pgPort;Database=tododb;Username=todo;Password=todo-verify"
         $redis = "127.0.0.1:$redisPort"
@@ -341,57 +349,55 @@ function Invoke-PublishedWeb {
         $migrate.Process.Dispose()
 
         Write-Host "Starting published API on http://127.0.0.1:0"
-        $listenState = [hashtable]::Synchronized(@{
-                Url = $null
-                Log = [System.Text.StringBuilder]::new()
-            })
-
-        $info = [System.Diagnostics.ProcessStartInfo]::new()
-        $info.FileName = 'dotnet'
-        $info.ArgumentList.Add($dll)
-        $info.WorkingDirectory = $resolvedPublish
-        $info.UseShellExecute = $false
-        $info.RedirectStandardOutput = $true
-        $info.RedirectStandardError = $true
-        $info.CreateNoWindow = $true
-        $info.Environment['ConnectionStrings__tododb'] = $tododb
-        $info.Environment['ConnectionStrings__redis'] = $redis
-        $info.Environment['ASPNETCORE_URLS'] = 'http://127.0.0.1:0'
-        $info.Environment['HOSTNAME'] = $replica
-        $info.Environment['BuildVersion'] = 'verify-published'
-        $info.Environment['BuildCommit'] = 'verify'
-
-        $apiProcess = [System.Diagnostics.Process]::new()
-        $apiProcess.StartInfo = $info
-        $apiProcess.EnableRaisingEvents = $true
-        $onLine = {
-            param($sender, $e)
-            if ($null -eq $e.Data) { return }
-            [void]$listenState.Log.AppendLine($e.Data)
-            Write-Host $e.Data
-            if ($e.Data -match 'Now listening on:\s*(https?://\S+)') {
-                $listenState.Url = $Matches[1].TrimEnd('/')
+        # Poll log files instead of OutputDataReceived scriptblocks (no Runspace on thread-pool threads).
+        $outLog = Join-Path ([System.IO.Path]::GetTempPath()) ("todo-api-out-" + [guid]::NewGuid().ToString('N') + '.log')
+        $errLog = Join-Path ([System.IO.Path]::GetTempPath()) ("todo-api-err-" + [guid]::NewGuid().ToString('N') + '.log')
+        $apiProcess = Start-Process -FilePath 'dotnet' -ArgumentList @($dll) `
+            -WorkingDirectory $resolvedPublish `
+            -PassThru -NoNewWindow `
+            -RedirectStandardOutput $outLog `
+            -RedirectStandardError $errLog `
+            -Environment @{
+                'ConnectionStrings__tododb' = $tododb
+                'ConnectionStrings__redis' = $redis
+                'ASPNETCORE_URLS' = 'http://127.0.0.1:0'
+                'HOSTNAME' = $replica
+                'BuildVersion' = 'verify-published'
+                'BuildCommit' = 'verify'
             }
-        }.GetNewClosure()
-        $apiProcess.add_OutputDataReceived($onLine)
-        $apiProcess.add_ErrorDataReceived($onLine)
-        if (-not $apiProcess.Start()) {
+        if (-not $apiProcess) {
             throw 'Failed to start published Todo.Api.dll.'
         }
-        $apiProcess.BeginOutputReadLine()
-        $apiProcess.BeginErrorReadLine()
 
+        $listenUrl = $null
         $deadline = [DateTime]::UtcNow + [TimeSpan]::FromMinutes(1)
-        while ([DateTime]::UtcNow -lt $deadline -and -not $listenState.Url) {
+        while ([DateTime]::UtcNow -lt $deadline -and -not $listenUrl) {
             if ($apiProcess.HasExited) {
-                throw "Published API exited before listening (code $($apiProcess.ExitCode)). captured=$($listenState.Log)"
+                $captured = ''
+                if (Test-Path -LiteralPath $outLog) { $captured += Get-Content -LiteralPath $outLog -Raw -ErrorAction SilentlyContinue }
+                if (Test-Path -LiteralPath $errLog) { $captured += Get-Content -LiteralPath $errLog -Raw -ErrorAction SilentlyContinue }
+                throw "Published API exited before listening (code $($apiProcess.ExitCode)). captured=$captured"
             }
-            Start-Sleep -Milliseconds 100
+
+            foreach ($logPath in @($outLog, $errLog)) {
+                if (-not (Test-Path -LiteralPath $logPath)) { continue }
+                $text = Get-Content -LiteralPath $logPath -Raw -ErrorAction SilentlyContinue
+                if ([string]::IsNullOrEmpty($text)) { continue }
+                if ($text -match 'Now listening on:\s*(https?://\S+)') {
+                    $listenUrl = $Matches[1].TrimEnd('/')
+                    break
+                }
+            }
+            if (-not $listenUrl) {
+                Start-Sleep -Milliseconds 100
+            }
         }
 
-        $listenUrl = $listenState.Url
         if (-not $listenUrl) {
-            throw "Timed out waiting for published Kestrel listen URL. captured=$($listenState.Log)"
+            $captured = ''
+            if (Test-Path -LiteralPath $outLog) { $captured += Get-Content -LiteralPath $outLog -Raw -ErrorAction SilentlyContinue }
+            if (Test-Path -LiteralPath $errLog) { $captured += Get-Content -LiteralPath $errLog -Raw -ErrorAction SilentlyContinue }
+            throw "Timed out waiting for published Kestrel listen URL. captured=$captured"
         }
 
         Write-Host "Published API listening at $listenUrl"
