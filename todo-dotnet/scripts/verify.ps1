@@ -286,10 +286,7 @@ function Invoke-PublishedWeb {
     $pgPort = Get-FreeTcpPort
     $redisPort = Get-FreeTcpPort
     $apiProcess = $null
-    $outLog = $null
-    $errLog = $null
-    $outWriter = $null
-    $errWriter = $null
+    $drainPowerShells = @()
     $runError = $null
     $cleanupError = $null
     $replica = 'verify-published'
@@ -355,14 +352,7 @@ function Invoke-PublishedWeb {
 
         Write-Host "Starting published API on http://127.0.0.1:0"
         # ProcessStartInfo.Environment (not Start-Process -Environment) keeps PS < 7.4 working.
-        # ReadLineAsync on the main thread avoids OutputDataReceived scriptblocks (no Runspace).
-        $outLog = Join-Path ([System.IO.Path]::GetTempPath()) ("todo-api-out-" + [guid]::NewGuid().ToString('N') + '.log')
-        $errLog = Join-Path ([System.IO.Path]::GetTempPath()) ("todo-api-err-" + [guid]::NewGuid().ToString('N') + '.log')
-        $outWriter = [System.IO.StreamWriter]::new($outLog, $false, [System.Text.Encoding]::UTF8)
-        $errWriter = [System.IO.StreamWriter]::new($errLog, $false, [System.Text.Encoding]::UTF8)
-        $outWriter.AutoFlush = $true
-        $errWriter.AutoFlush = $true
-
+        # Dedicated drain runspaces keep reading until EOF so redirected pipes cannot fill during Playwright.
         $info = [System.Diagnostics.ProcessStartInfo]::new()
         $info.FileName = 'dotnet'
         $info.ArgumentList.Add('Todo.Api.dll')
@@ -384,47 +374,77 @@ function Invoke-PublishedWeb {
             throw 'Failed to start published Todo.Api.dll.'
         }
 
-        $listenUrl = $null
-        $captured = [System.Text.StringBuilder]::new()
-        $pendingOut = $apiProcess.StandardOutput.ReadLineAsync()
-        $pendingErr = $apiProcess.StandardError.ReadLineAsync()
-        $deadline = [DateTime]::UtcNow + [TimeSpan]::FromMinutes(1)
-        while ([DateTime]::UtcNow -lt $deadline -and -not $listenUrl) {
-            if ($pendingOut.IsCompleted) {
-                $line = $pendingOut.GetAwaiter().GetResult()
-                if ($null -ne $line) {
-                    [void]$captured.AppendLine($line)
-                    $outWriter.WriteLine($line)
-                    if ($line -match 'Now listening on:\s*(https?://\S+)') {
-                        $listenUrl = $Matches[1].TrimEnd('/')
+        $streamState = [hashtable]::Synchronized(@{
+                Url      = $null
+                Captured = [System.Text.StringBuilder]::new()
+                MaxChars = 65536
+                Gate     = [object]::new()
+            })
+
+        $drainScript = {
+            param(
+                [System.IO.StreamReader] $Reader,
+                [hashtable] $State
+            )
+            try {
+                while ($null -ne ($line = $Reader.ReadLine())) {
+                    if ($null -eq $State['Url'] -and $line -match 'Now listening on:\s*(https?://\S+)') {
+                        $State['Url'] = $Matches[1].TrimEnd('/')
                     }
-                    $pendingOut = $apiProcess.StandardOutput.ReadLineAsync()
+
+                    $gate = $State['Gate']
+                    [System.Threading.Monitor]::Enter($gate)
+                    try {
+                        $captured = $State['Captured']
+                        $maxChars = [int]$State['MaxChars']
+                        if ($captured.Length -ge $maxChars) {
+                            continue
+                        }
+
+                        $chunk = $line + [Environment]::NewLine
+                        $room = $maxChars - $captured.Length
+                        if ($chunk.Length -gt $room) {
+                            $chunk = $chunk.Substring(0, $room)
+                        }
+                        [void]$captured.Append($chunk)
+                    }
+                    finally {
+                        [System.Threading.Monitor]::Exit($gate)
+                    }
                 }
             }
-
-            if ($pendingErr.IsCompleted) {
-                $line = $pendingErr.GetAwaiter().GetResult()
-                if ($null -ne $line) {
-                    [void]$captured.AppendLine($line)
-                    $errWriter.WriteLine($line)
-                    if ($line -match 'Now listening on:\s*(https?://\S+)') {
-                        $listenUrl = $Matches[1].TrimEnd('/')
-                    }
-                    $pendingErr = $apiProcess.StandardError.ReadLineAsync()
-                }
-            }
-
-            if ($apiProcess.HasExited -and $pendingOut.IsCompleted -and $pendingErr.IsCompleted -and -not $listenUrl) {
-                throw "Published API exited before listening (code $($apiProcess.ExitCode)). captured=$captured"
-            }
-
-            if (-not $listenUrl) {
-                Start-Sleep -Milliseconds 50
+            catch {
+                # Stream closes when the process exits; drain runspace ends.
             }
         }
 
+        foreach ($reader in @($apiProcess.StandardOutput, $apiProcess.StandardError)) {
+            $ps = [powershell]::Create()
+            [void]$ps.AddScript($drainScript).AddArgument($reader).AddArgument($streamState)
+            [void]$ps.BeginInvoke()
+            $drainPowerShells += $ps
+        }
+
+        $listenUrl = $null
+        $deadline = [DateTime]::UtcNow + [TimeSpan]::FromMinutes(1)
+        while ([DateTime]::UtcNow -lt $deadline -and -not $listenUrl) {
+            $listenUrl = $streamState['Url']
+            if ($listenUrl) { break }
+
+            if ($apiProcess.HasExited) {
+                Start-Sleep -Milliseconds 100
+                $listenUrl = $streamState['Url']
+                if (-not $listenUrl) {
+                    throw "Published API exited before listening (code $($apiProcess.ExitCode)). captured=$($streamState['Captured'])"
+                }
+                break
+            }
+
+            Start-Sleep -Milliseconds 50
+        }
+
         if (-not $listenUrl) {
-            throw "Timed out waiting for published Kestrel listen URL. captured=$captured"
+            throw "Timed out waiting for published Kestrel listen URL. captured=$($streamState['Captured'])"
         }
 
         Write-Host "Published API listening at $listenUrl"
@@ -492,17 +512,10 @@ function Invoke-PublishedWeb {
             if ($null -ne $apiProcess) { $apiProcess.Dispose() }
         }
 
-        foreach ($writer in @($outWriter, $errWriter)) {
-            if ($null -eq $writer) { continue }
-            try { $writer.Dispose() } catch { }
-        }
-
-        foreach ($logPath in @($outLog, $errLog)) {
-            if ([string]::IsNullOrWhiteSpace($logPath)) { continue }
+        foreach ($ps in $drainPowerShells) {
             try {
-                if (Test-Path -LiteralPath $logPath) {
-                    Remove-Item -LiteralPath $logPath -Force -ErrorAction Stop
-                }
+                $ps.Stop()
+                $ps.Dispose()
             }
             catch {
                 if ($null -eq $cleanupError) { $cleanupError = $_ }
