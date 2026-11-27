@@ -2,6 +2,7 @@ using System.Net;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.EntityFrameworkCore;
+using StackExchange.Redis;
 
 if (args is ["migrate"])
 {
@@ -37,6 +38,23 @@ if (!string.IsNullOrWhiteSpace(tododb))
 {
     builder.Services.AddDbContext<TodoDbContext>(options => options.UseNpgsql(tododb));
 }
+
+var redis = builder.Configuration.GetConnectionString("redis");
+if (!string.IsNullOrWhiteSpace(redis))
+{
+    builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
+    {
+        var options = ConfigurationOptions.Parse(redis);
+        options.AbortOnConnectFail = false;
+        return ConnectionMultiplexer.Connect(options);
+    });
+}
+
+builder.Services.AddSingleton<TodoListCache>(sp =>
+{
+    var mux = sp.GetService<IConnectionMultiplexer>();
+    return new TodoListCache(mux, sp.GetRequiredService<ILogger<TodoListCache>>());
+});
 
 var app = builder.Build();
 
@@ -91,10 +109,11 @@ app.MapGet("/version", () => Results.Json(build, AppJson.Options));
 
 if (!string.IsNullOrWhiteSpace(tododb))
 {
-    app.MapGet("/api/todos", async (TodoDbContext db, CancellationToken ct) =>
+    app.MapGet("/api/todos", async (TodoDbContext db, TodoListCache cache, CancellationToken ct) =>
     {
-        var todos = await TodoQueries.ReadTodosAsync(db, ct);
-        return Results.Json(todos, AppJson.Options);
+        var result = await cache.ListAsync(db, ct);
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(result.Items, AppJson.Options);
+        return new CachedListResult(bytes, result.CacheHit);
     });
 
     app.MapPost("/api/todos", TodoCommands.CreateTodoAsync);
@@ -131,6 +150,18 @@ file static class AppJson
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     };
+}
+
+file sealed class CachedListResult(byte[] bytes, bool cacheHit) : IResult
+{
+    public async Task ExecuteAsync(HttpContext httpContext)
+    {
+        var response = httpContext.Response;
+        response.StatusCode = StatusCodes.Status200OK;
+        response.ContentType = "application/json";
+        response.Headers["X-Cache"] = cacheHit ? "hit" : "miss";
+        await response.Body.WriteAsync(bytes);
+    }
 }
 
 public partial class Program;

@@ -13,6 +13,7 @@ internal static class TodoCommands
     internal static async Task<IResult> CreateTodoAsync(
         HttpRequest request,
         TodoDbContext db,
+        TodoListCache cache,
         CancellationToken ct)
     {
         var (body, error) = await TodoRequestBody.ReadCreateAsync(request, ct);
@@ -35,6 +36,8 @@ internal static class TodoCommands
             db.Todos.Add(row);
             await db.SaveChangesAsync(ct);
 
+            await cache.InvalidateAsync(ct);
+
             var response = new TodoResponse(row.Id, row.Title, row.Done, row.CreatedAt, row.UpdatedAt);
             var bytes = JsonSerializer.SerializeToUtf8Bytes(response, ResponseOptions);
             return new RawJsonResult(
@@ -56,6 +59,7 @@ internal static class TodoCommands
         string id,
         HttpRequest request,
         TodoDbContext db,
+        TodoListCache cache,
         CancellationToken ct)
     {
         if (!TryParsePositiveId(id, out var todoId))
@@ -120,6 +124,8 @@ internal static class TodoCommands
             await db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
 
+            await cache.InvalidateAsync(ct);
+
             var response = new TodoResponse(
                 locked.Id,
                 locked.Title,
@@ -143,6 +149,7 @@ internal static class TodoCommands
         string id,
         HttpRequest request,
         TodoDbContext db,
+        TodoListCache cache,
         CancellationToken ct)
     {
         if (!TryParsePositiveId(id, out var todoId))
@@ -157,6 +164,8 @@ internal static class TodoCommands
             {
                 return JsonError.Write(StatusCodes.Status404NotFound, "todo not found");
             }
+
+            await cache.InvalidateAsync(ct);
 
             return Results.NoContent();
         }

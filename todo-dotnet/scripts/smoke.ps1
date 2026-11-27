@@ -24,9 +24,21 @@ if ([string]::IsNullOrWhiteSpace([string]$payload.commit)) {
     throw "GET /version missing commit field: $($response.Content)"
 }
 
+function Get-CacheHeader($response) {
+    $values = @($response.Headers['X-Cache'])
+    if ($values.Count -lt 1 -or [string]::IsNullOrWhiteSpace([string]$values[0])) {
+        throw "missing X-Cache header"
+    }
+    return [string]$values[0]
+}
+
 $todosResponse = Invoke-WebRequest -Uri $todosUrl -Method GET
 if ($todosResponse.StatusCode -ne 200) {
     throw "GET /api/todos returned $($todosResponse.StatusCode)"
+}
+$firstCache = Get-CacheHeader $todosResponse
+if ($firstCache -ne 'miss') {
+    throw "first GET /api/todos X-Cache='$firstCache', want 'miss'"
 }
 
 $todosContent = [string]$todosResponse.Content
@@ -46,6 +58,15 @@ if ($todosJson -isnot [System.Array]) {
 
 # Assign the parsed array, then read .Length (do not wrap ConvertFrom-Json in @(...).Length).
 $beforeCount = $todosJson.Length
+
+$hitResponse = Invoke-WebRequest -Uri $todosUrl -Method GET
+if ($hitResponse.StatusCode -ne 200) {
+    throw "second GET /api/todos returned $($hitResponse.StatusCode)"
+}
+$secondCache = Get-CacheHeader $hitResponse
+if ($secondCache -ne 'hit') {
+    throw "second GET /api/todos X-Cache='$secondCache', want 'hit'"
+}
 
 $createBody = '{"title":"  buy milk  "}'
 $createResponse = Invoke-WebRequest -Uri $todosUrl -Method POST -Body $createBody -ContentType 'application/json'
@@ -72,6 +93,10 @@ if ($location -ne $expectedLocation) {
 }
 
 $listAfterCreate = Invoke-WebRequest -Uri $todosUrl -Method GET
+$afterCreateCache = Get-CacheHeader $listAfterCreate
+if ($afterCreateCache -ne 'miss') {
+    throw "GET /api/todos after POST X-Cache='$afterCreateCache', want 'miss'"
+}
 $listContent = [string]$listAfterCreate.Content
 $listJson = $listContent | ConvertFrom-Json -NoEnumerate
 if ($listJson -isnot [System.Array]) {
@@ -80,6 +105,12 @@ if ($listJson -isnot [System.Array]) {
 $afterCreateCount = $listJson.Length
 if ($afterCreateCount -ne ($beforeCount + 1)) {
     throw "GET /api/todos after create expected $($beforeCount + 1) rows, got $afterCreateCount"
+}
+
+$hitAfterCreate = Invoke-WebRequest -Uri $todosUrl -Method GET
+$hitAfterCreateCache = Get-CacheHeader $hitAfterCreate
+if ($hitAfterCreateCache -ne 'hit') {
+    throw "second GET after POST X-Cache='$hitAfterCreateCache', want 'hit'"
 }
 
 $listed = $null
