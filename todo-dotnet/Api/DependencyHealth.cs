@@ -26,7 +26,7 @@ internal static class DependencyHealth
         var deadlineTask = Task.Delay(Deadline, clock, ct);
 
         var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        // Capture token before scheduling; workers must not read a cleared CTS local.
+        // Capture the token once; linked is disposed only after every probe task completes.
         var token = linked.Token;
         var outcomes = new int[probes.Count];
         var tasks = new Task[probes.Count];

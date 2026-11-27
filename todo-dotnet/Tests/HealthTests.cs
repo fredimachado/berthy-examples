@@ -115,8 +115,7 @@ public sealed class HealthTests
         release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         startedCount = 0;
         var redisHung = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        // No RunContinuationsAsynchronously: SetResult runs the waiter inline after record.
-        var postgresRecorded = new TaskCompletionSource();
+        var postgresRecorded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         Task OkThenSignalAsync(CancellationToken ct)
         {
@@ -169,6 +168,7 @@ public sealed class HealthTests
             await redisHung.Task.WaitAsync(TimeSpan.FromSeconds(5));
             Assert.Equal(2, startedCount);
 
+            // onSucceededInBudget fires after the in-budget CAS — only then advance.
             await postgresRecorded.Task.WaitAsync(TimeSpan.FromSeconds(5));
             clock.Advance(TimeSpan.FromSeconds(2));
             failed = await healthTask.WaitAsync(TimeSpan.FromSeconds(5));
@@ -184,13 +184,14 @@ public sealed class HealthTests
     public async Task HealthSchedulesProbesIndependentlyOfSyncWorkBeforeFirstAwait()
     {
         var clock = new FakeTimeProvider();
-        var redisStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var postgresHolding = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var redisStartedWhileHeld = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var holdPostgres = new ManualResetEventSlim(false);
 
         Task PostgresBlocksSynchronouslyBeforeAwait(CancellationToken ct)
         {
-            // Sync hold before any await — must not stall scheduling of redis or the deadline wait.
-            // Bound the wait so a broken scheduler fails the test instead of hanging the host.
+            postgresHolding.TrySetResult();
+            // Sync hold before any await — concurrent scheduling must start redis while we wait.
             if (!holdPostgres.Wait(TimeSpan.FromSeconds(10), ct))
             {
                 throw new TimeoutException("Postgres sync hold timed out.");
@@ -201,7 +202,11 @@ public sealed class HealthTests
 
         async Task RedisSignalsThenHangsAsync(CancellationToken ct)
         {
-            redisStarted.TrySetResult();
+            // Fail fast if postgres was already released — that implies sequential scheduling.
+            Assert.False(
+                holdPostgres.IsSet,
+                "Redis started after Postgres was released; probes were not scheduled concurrently.");
+            redisStartedWhileHeld.TrySetResult();
             await Task.Delay(Timeout.InfiniteTimeSpan, ct);
         }
 
@@ -211,11 +216,17 @@ public sealed class HealthTests
             new("redis", RedisSignalsThenHangsAsync),
         };
 
-        var healthTask = DependencyHealth.FailedDependenciesAsync(probes, clock, CancellationToken.None);
+        // Run on a worker so an inline/sequential probe loop cannot block this test thread.
+        var healthTask = Task.Run(
+            () => DependencyHealth.FailedDependenciesAsync(probes, clock, CancellationToken.None),
+            CancellationToken.None);
+
         try
         {
-            // Redis must start while postgres is still blocked on its probe thread.
-            await redisStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await postgresHolding.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            // Redis must signal while Postgres is still held (before release / hold timeout).
+            await redisStartedWhileHeld.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.False(holdPostgres.IsSet);
 
             clock.Advance(DependencyHealth.Deadline);
             var failed = await healthTask.WaitAsync(TimeSpan.FromSeconds(5));
@@ -231,13 +242,13 @@ public sealed class HealthTests
     public async Task HealthLateSuccessAfterDeadlineStillReportsFailed()
     {
         var clock = new FakeTimeProvider();
-        // No RunContinuationsAsynchronously: postgres advances inline after redis is recorded.
-        var redisRecorded = new TaskCompletionSource();
+        var redisRecorded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         Task RedisOkFirstAsync(CancellationToken ct) => Task.CompletedTask;
 
         async Task AdvancePastDeadlineThenSucceedAsync(CancellationToken ct)
         {
+            // Wait until redis's in-budget success was recorded, then advance and succeed late.
             await redisRecorded.Task.WaitAsync(ct);
             clock.Advance(TimeSpan.FromSeconds(2));
             await Task.CompletedTask;
@@ -261,6 +272,82 @@ public sealed class HealthTests
                 }
             });
         Assert.Equal(new[] { "postgres" }, failed);
+    }
+
+    [Fact]
+    public async Task HealthLateSuccessRejectedByElapsedCheckWhileDeadlineTimerHeld()
+    {
+        // Clock advances past the deadline while the deadline timer callback is held, so the
+        // deadline loop cannot mark Pending→Failed yet. Postgres's late success must fail the
+        // elapsed-time check in TryRecordSuccess specifically.
+        using var holdTimerCallbacks = new ManualResetEventSlim(false);
+        var timerCallbackEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var clock = new HoldableFakeTimeProvider(holdTimerCallbacks, timerCallbackEntered);
+        var redisRecorded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allowPostgresFinish = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var postgresCheckReturned = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var postgresSucceededInBudget = 0;
+
+        Task RedisOkFirstAsync(CancellationToken ct) => Task.CompletedTask;
+
+        async Task LateSuccessAfterClockPastDeadlineAsync(CancellationToken ct)
+        {
+            await redisRecorded.Task.WaitAsync(ct);
+            await allowPostgresFinish.Task.WaitAsync(ct);
+            await Task.CompletedTask;
+            postgresCheckReturned.TrySetResult();
+        }
+
+        var probes = new DependencyProbe[]
+        {
+            new("postgres", LateSuccessAfterClockPastDeadlineAsync),
+            new("redis", RedisOkFirstAsync),
+        };
+
+        var healthTask = DependencyHealth.FailedDependenciesAsync(
+            probes,
+            clock,
+            CancellationToken.None,
+            name =>
+            {
+                if (name == "redis")
+                {
+                    redisRecorded.TrySetResult();
+                }
+                else if (name == "postgres")
+                {
+                    Interlocked.Exchange(ref postgresSucceededInBudget, 1);
+                }
+            });
+
+        try
+        {
+            await redisRecorded.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var startedAt = clock.GetTimestamp();
+            // Advance on a worker: time moves forward, then the deadline timer callback blocks.
+            var advanceTask = Task.Run(() => clock.Advance(DependencyHealth.Deadline), CancellationToken.None);
+            await timerCallbackEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.True(clock.GetElapsedTime(startedAt) >= DependencyHealth.Deadline);
+
+            // Late success while deadline path is still blocked on the held timer callback.
+            allowPostgresFinish.TrySetResult();
+            await postgresCheckReturned.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Task.Yield();
+            Assert.Equal(0, Volatile.Read(ref postgresSucceededInBudget));
+
+            holdTimerCallbacks.Set();
+            await advanceTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var failed = await healthTask.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(new[] { "postgres" }, failed);
+            Assert.Equal(0, Volatile.Read(ref postgresSucceededInBudget));
+        }
+        finally
+        {
+            allowPostgresFinish.TrySetResult();
+            holdTimerCallbacks.Set();
+        }
     }
 
     [Fact]
@@ -349,8 +436,8 @@ public sealed class HealthTests
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseCallback = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var callbackEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        // No RunContinuationsAsynchronously: Advance only after redis success is recorded.
-        var redisRecorded = new TaskCompletionSource();
+        var redisRecorded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task? advanceTask = null;
 
         async Task HangWithHeldCancelAsync(CancellationToken ct)
         {
@@ -392,7 +479,9 @@ public sealed class HealthTests
                 });
             await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
             await redisRecorded.Task.WaitAsync(TimeSpan.FromSeconds(5));
-            clock.Advance(TimeSpan.FromSeconds(2));
+
+            // Advance on a worker so a sync cancel callback cannot block this thread before finally.
+            advanceTask = Task.Run(() => clock.Advance(TimeSpan.FromSeconds(2)), CancellationToken.None);
 
             var failed = await healthTask.WaitAsync(TimeSpan.FromSeconds(5));
             Assert.Equal(new[] { "postgres" }, failed);
@@ -402,6 +491,10 @@ public sealed class HealthTests
         finally
         {
             releaseCallback.TrySetResult();
+            if (advanceTask is not null)
+            {
+                await advanceTask.WaitAsync(TimeSpan.FromSeconds(5));
+            }
         }
     }
 
@@ -464,5 +557,49 @@ public sealed class HealthTests
             .Select(e => e.GetString())
             .ToArray();
         Assert.Equal(expected, failed);
+    }
+}
+
+/// <summary>
+/// FakeTimeProvider that advances wall time first, then holds each due timer callback until released.
+/// </summary>
+file sealed class HoldableFakeTimeProvider : TimeProvider
+{
+    private readonly FakeTimeProvider _inner = new();
+    private readonly ManualResetEventSlim _releaseCallbacks;
+    private readonly TaskCompletionSource _callbackEntered;
+
+    public HoldableFakeTimeProvider(
+        ManualResetEventSlim releaseCallbacks,
+        TaskCompletionSource callbackEntered)
+    {
+        _releaseCallbacks = releaseCallbacks;
+        _callbackEntered = callbackEntered;
+    }
+
+    public override long TimestampFrequency => _inner.TimestampFrequency;
+
+    public override DateTimeOffset GetUtcNow() => _inner.GetUtcNow();
+
+    public override long GetTimestamp() => _inner.GetTimestamp();
+
+    public void Advance(TimeSpan delta) => _inner.Advance(delta);
+
+    public override ITimer CreateTimer(
+        TimerCallback callback,
+        object? state,
+        TimeSpan dueTime,
+        TimeSpan period)
+    {
+        return _inner.CreateTimer(
+            s =>
+            {
+                _callbackEntered.TrySetResult();
+                _releaseCallbacks.Wait();
+                callback(s);
+            },
+            state,
+            dueTime,
+            period);
     }
 }
