@@ -12,14 +12,22 @@ internal static class DependencyHealth
     /// <summary>
     /// Runs probes concurrently under one shared deadline. Failures keep probe order.
     /// </summary>
+    /// <param name="onSucceededInBudget">
+    /// Optional hook invoked after a probe is recorded as in-budget success (for tests).
+    /// </param>
     internal static async Task<string[]> FailedDependenciesAsync(
-        IReadOnlyList<DependencyProbe> probes, TimeProvider clock, CancellationToken ct)
+        IReadOnlyList<DependencyProbe> probes,
+        TimeProvider clock,
+        CancellationToken ct,
+        Action<string>? onSucceededInBudget = null)
     {
         // Shared start for elapsed checks at success-record time (CAS alone is not enough).
         var startedAt = clock.GetTimestamp();
         var deadlineTask = Task.Delay(Deadline, clock, ct);
 
         var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        // Capture token before scheduling; workers must not read a cleared CTS local.
+        var token = linked.Token;
         var outcomes = new int[probes.Count];
         var tasks = new Task[probes.Count];
         for (var i = 0; i < probes.Count; i++)
@@ -29,7 +37,7 @@ internal static class DependencyHealth
             // Schedule on the thread pool so sync work before a probe's first await cannot
             // delay starting sibling probes or arming Task.WhenAny on the deadline.
             tasks[i] = Task.Run(
-                () => ProbeAsync(probe, linked.Token, outcomes, index, clock, startedAt),
+                () => ProbeAsync(probe, token, outcomes, index, clock, startedAt, onSucceededInBudget),
                 CancellationToken.None);
         }
 
@@ -43,9 +51,7 @@ internal static class DependencyHealth
                 Interlocked.CompareExchange(ref outcomes[i], Failed, Pending);
             }
 
-            var toCleanup = linked;
-            linked = null!;
-            _ = CleanupAfterDeadlineAsync(toCleanup, tasks);
+            _ = CleanupAfterDeadlineAsync(linked, tasks);
         }
         else
         {
@@ -77,12 +83,16 @@ internal static class DependencyHealth
         int[] outcomes,
         int index,
         TimeProvider clock,
-        long startedAt)
+        long startedAt,
+        Action<string>? onSucceededInBudget)
     {
         try
         {
             await probe.CheckAsync(ct);
-            TryRecordSuccess(outcomes, index, clock, startedAt);
+            if (TryRecordSuccess(outcomes, index, clock, startedAt))
+            {
+                onSucceededInBudget?.Invoke(probe.Name);
+            }
         }
         catch (Exception)
         {
@@ -92,17 +102,18 @@ internal static class DependencyHealth
 
     /// <summary>
     /// Success counts only when recorded before the shared deadline elapses.
+    /// Returns true when this call recorded an in-budget success.
     /// </summary>
-    private static void TryRecordSuccess(
+    private static bool TryRecordSuccess(
         int[] outcomes, int index, TimeProvider clock, long startedAt)
     {
         if (clock.GetElapsedTime(startedAt) >= Deadline)
         {
             Interlocked.CompareExchange(ref outcomes[index], Failed, Pending);
-            return;
+            return false;
         }
 
-        Interlocked.CompareExchange(ref outcomes[index], SucceededInBudget, Pending);
+        return Interlocked.CompareExchange(ref outcomes[index], SucceededInBudget, Pending) == Pending;
     }
 
     private static Task CleanupAfterDeadlineAsync(CancellationTokenSource cts, Task[] tasks) =>

@@ -115,8 +115,9 @@ public sealed class HealthTests
         release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         startedCount = 0;
         var redisHung = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        // No RunContinuationsAsynchronously: SetResult runs the waiter inline after record.
+        var postgresRecorded = new TaskCompletionSource();
 
-        // Non-async so ProbeAsync can record in-budget success without an async yield.
         Task OkThenSignalAsync(CancellationToken ct)
         {
             if (Interlocked.Increment(ref startedCount) == 2)
@@ -151,17 +152,32 @@ public sealed class HealthTests
             new("redis", HangRedisAsync),
         ];
 
-        healthTask = DependencyHealth.FailedDependenciesAsync(probes, clock, CancellationToken.None);
-        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        await redisHung.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        Assert.Equal(2, startedCount);
+        try
+        {
+            healthTask = DependencyHealth.FailedDependenciesAsync(
+                probes,
+                clock,
+                CancellationToken.None,
+                name =>
+                {
+                    if (name == "postgres")
+                    {
+                        postgresRecorded.TrySetResult();
+                    }
+                });
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await redisHung.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(2, startedCount);
 
-        // Wall-clock pause with fake clock still at T0 so the fast probe's success is recorded
-        // before Advance (Task.Run can interleave started/redisHung ahead of TryRecordSuccess).
-        await Task.Delay(50);
-        clock.Advance(TimeSpan.FromSeconds(2));
-        failed = await healthTask.WaitAsync(TimeSpan.FromSeconds(5));
-        Assert.Equal(new[] { "redis" }, failed);
+            await postgresRecorded.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            clock.Advance(TimeSpan.FromSeconds(2));
+            failed = await healthTask.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(new[] { "redis" }, failed);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
     }
 
     [Fact]
@@ -174,7 +190,12 @@ public sealed class HealthTests
         Task PostgresBlocksSynchronouslyBeforeAwait(CancellationToken ct)
         {
             // Sync hold before any await — must not stall scheduling of redis or the deadline wait.
-            holdPostgres.Wait(ct);
+            // Bound the wait so a broken scheduler fails the test instead of hanging the host.
+            if (!holdPostgres.Wait(TimeSpan.FromSeconds(10), ct))
+            {
+                throw new TimeoutException("Postgres sync hold timed out.");
+            }
+
             return Task.CompletedTask;
         }
 
@@ -191,32 +212,32 @@ public sealed class HealthTests
         };
 
         var healthTask = DependencyHealth.FailedDependenciesAsync(probes, clock, CancellationToken.None);
+        try
+        {
+            // Redis must start while postgres is still blocked on its probe thread.
+            await redisStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        // Redis must start while postgres is still blocked on the calling thread of its probe.
-        await redisStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
-
-        clock.Advance(DependencyHealth.Deadline);
-        var failed = await healthTask.WaitAsync(TimeSpan.FromSeconds(5));
-        Assert.Equal(new[] { "postgres", "redis" }, failed);
-
-        holdPostgres.Set();
+            clock.Advance(DependencyHealth.Deadline);
+            var failed = await healthTask.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(new[] { "postgres", "redis" }, failed);
+        }
+        finally
+        {
+            holdPostgres.Set();
+        }
     }
 
     [Fact]
     public async Task HealthLateSuccessAfterDeadlineStillReportsFailed()
     {
         var clock = new FakeTimeProvider();
-        var redisRecorded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        // No RunContinuationsAsynchronously: postgres advances inline after redis is recorded.
+        var redisRecorded = new TaskCompletionSource();
 
-        async Task RedisOkFirstAsync(CancellationToken ct)
-        {
-            await Task.CompletedTask;
-            redisRecorded.TrySetResult();
-        }
+        Task RedisOkFirstAsync(CancellationToken ct) => Task.CompletedTask;
 
         async Task AdvancePastDeadlineThenSucceedAsync(CancellationToken ct)
         {
-            // Let redis record an in-budget success first; then advance inside this probe.
             await redisRecorded.Task.WaitAsync(ct);
             clock.Advance(TimeSpan.FromSeconds(2));
             await Task.CompletedTask;
@@ -229,7 +250,16 @@ public sealed class HealthTests
         };
 
         var failed = await DependencyHealth.FailedDependenciesAsync(
-            probes, clock, CancellationToken.None);
+            probes,
+            clock,
+            CancellationToken.None,
+            name =>
+            {
+                if (name == "redis")
+                {
+                    redisRecorded.TrySetResult();
+                }
+            });
         Assert.Equal(new[] { "postgres" }, failed);
     }
 
@@ -319,6 +349,8 @@ public sealed class HealthTests
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseCallback = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var callbackEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        // No RunContinuationsAsynchronously: Advance only after redis success is recorded.
+        var redisRecorded = new TaskCompletionSource();
 
         async Task HangWithHeldCancelAsync(CancellationToken ct)
         {
@@ -342,19 +374,35 @@ public sealed class HealthTests
         var probes = new DependencyProbe[]
         {
             new("postgres", HangWithHeldCancelAsync),
-            new("redis", async _ => await Task.CompletedTask),
+            new("redis", static _ => Task.CompletedTask),
         };
 
-        var healthTask = DependencyHealth.FailedDependenciesAsync(probes, clock, CancellationToken.None);
-        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        clock.Advance(TimeSpan.FromSeconds(2));
+        try
+        {
+            var healthTask = DependencyHealth.FailedDependenciesAsync(
+                probes,
+                clock,
+                CancellationToken.None,
+                name =>
+                {
+                    if (name == "redis")
+                    {
+                        redisRecorded.TrySetResult();
+                    }
+                });
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await redisRecorded.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            clock.Advance(TimeSpan.FromSeconds(2));
 
-        var failed = await healthTask.WaitAsync(TimeSpan.FromSeconds(5));
-        Assert.Equal(new[] { "postgres" }, failed);
+            var failed = await healthTask.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(new[] { "postgres" }, failed);
 
-        // Callback may still be held; releasing cleans up the background cancel path.
-        await callbackEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        releaseCallback.TrySetResult();
+            await callbackEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            releaseCallback.TrySetResult();
+        }
     }
 
     [Fact]

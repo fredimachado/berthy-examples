@@ -57,7 +57,6 @@ public sealed class AppHostGateTests
         using var cts = new CancellationTokenSource(Timeout);
 
         // Hold migrate, plant a conflicting todos table via SQL on the owned DB, then start migrate.
-        // No production plant-migration-conflict command.
         await using var host = await AspireHost.StartAsync(
             AppHostPath,
             cts.Token,
