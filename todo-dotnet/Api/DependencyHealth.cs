@@ -26,8 +26,11 @@ internal static class DependencyHealth
         {
             var index = i;
             var probe = probes[i];
-            // Probes run independently of the response wait; only the deadline gates the reply.
-            tasks[i] = ProbeAsync(probe, linked.Token, outcomes, index, clock, startedAt);
+            // Schedule on the thread pool so sync work before a probe's first await cannot
+            // delay starting sibling probes or arming Task.WhenAny on the deadline.
+            tasks[i] = Task.Run(
+                () => ProbeAsync(probe, linked.Token, outcomes, index, clock, startedAt),
+                CancellationToken.None);
         }
 
         var probeTask = Task.WhenAll(tasks);

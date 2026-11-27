@@ -116,14 +116,15 @@ public sealed class HealthTests
         startedCount = 0;
         var redisHung = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        async Task OkThenSignalAsync(CancellationToken ct)
+        // Non-async so ProbeAsync can record in-budget success without an async yield.
+        Task OkThenSignalAsync(CancellationToken ct)
         {
             if (Interlocked.Increment(ref startedCount) == 2)
             {
                 started.TrySetResult();
             }
 
-            await Task.CompletedTask;
+            return Task.CompletedTask;
         }
 
         async Task HangRedisAsync(CancellationToken ct)
@@ -155,9 +156,50 @@ public sealed class HealthTests
         await redisHung.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(2, startedCount);
 
+        // Wall-clock pause with fake clock still at T0 so the fast probe's success is recorded
+        // before Advance (Task.Run can interleave started/redisHung ahead of TryRecordSuccess).
+        await Task.Delay(50);
         clock.Advance(TimeSpan.FromSeconds(2));
         failed = await healthTask.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(new[] { "redis" }, failed);
+    }
+
+    [Fact]
+    public async Task HealthSchedulesProbesIndependentlyOfSyncWorkBeforeFirstAwait()
+    {
+        var clock = new FakeTimeProvider();
+        var redisStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var holdPostgres = new ManualResetEventSlim(false);
+
+        Task PostgresBlocksSynchronouslyBeforeAwait(CancellationToken ct)
+        {
+            // Sync hold before any await — must not stall scheduling of redis or the deadline wait.
+            holdPostgres.Wait(ct);
+            return Task.CompletedTask;
+        }
+
+        async Task RedisSignalsThenHangsAsync(CancellationToken ct)
+        {
+            redisStarted.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+        }
+
+        var probes = new DependencyProbe[]
+        {
+            new("postgres", PostgresBlocksSynchronouslyBeforeAwait),
+            new("redis", RedisSignalsThenHangsAsync),
+        };
+
+        var healthTask = DependencyHealth.FailedDependenciesAsync(probes, clock, CancellationToken.None);
+
+        // Redis must start while postgres is still blocked on the calling thread of its probe.
+        await redisStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        clock.Advance(DependencyHealth.Deadline);
+        var failed = await healthTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(new[] { "postgres", "redis" }, failed);
+
+        holdPostgres.Set();
     }
 
     [Fact]

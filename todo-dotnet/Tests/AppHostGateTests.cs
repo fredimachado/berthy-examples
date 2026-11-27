@@ -56,16 +56,25 @@ public sealed class AppHostGateTests
     {
         using var cts = new CancellationTokenSource(Timeout);
 
-        // Real AppHost path: conflict → migrate WaitForCompletion(conflict) → api WaitForCompletion(migrate).
+        // Hold migrate, plant a conflicting todos table via SQL on the owned DB, then start migrate.
+        // No production plant-migration-conflict command.
         await using var host = await AspireHost.StartAsync(
             AppHostPath,
             cts.Token,
-            new Dictionary<string, string?> { ["PlantMigrationConflict"] = "true" });
+            new Dictionary<string, string?> { ["HoldMigrateUntilStarted"] = "true" });
 
-        var conflictExit = await host.WaitForExitCodeAsync("conflict", cts.Token);
-        Assert.Equal(0, conflictExit);
+        await host.WaitAsync("tododb", "healthy", cts.Token);
+        await host.WaitAsync("redis", "healthy", cts.Token);
 
-        // Initial migrate must reach a terminal nonzero exit — not NotStarted / never-launched.
+        await host.ExecSqlOnOwnedPostgresAsync(
+            """
+            CREATE TABLE IF NOT EXISTS todos (
+                bogus integer PRIMARY KEY
+            );
+            """,
+            cts.Token);
+
+        await host.ResourceCommandAsync("migrate", "start", cts.Token);
         var failedExit = await host.WaitForExitCodeAsync("migrate", cts.Token);
         Assert.NotEqual(0, failedExit);
 

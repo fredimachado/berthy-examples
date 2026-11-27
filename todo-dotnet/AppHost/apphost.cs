@@ -10,13 +10,7 @@ var postgres = builder.AddPostgres("postgres").WithImageTag("17");
 var database = postgres.AddDatabase("tododb");
 var redis = builder.AddRedis("redis").WithImageTag("7");
 
-// Gate tests:
-// - PlantMigrationConflict=true → conflict resource before migrate
-// - HoldMigrateUntilStarted=true → migrate waits for an explicit start (ColdStart ordering)
-var plantConflict = string.Equals(
-    builder.Configuration["PlantMigrationConflict"],
-    "true",
-    StringComparison.OrdinalIgnoreCase);
+// Gate tests: HoldMigrateUntilStarted=true → migrate waits for an explicit start (ColdStart ordering).
 var holdMigrate = string.Equals(
     builder.Configuration["HoldMigrateUntilStarted"],
     "true",
@@ -27,24 +21,8 @@ var migrate = builder.AddDotnetProject(
         "../Api/Todo.Api.csproj",
         options => options.ExcludeLaunchProfile = true)
     .WithArgs(context => context.Args.Add("migrate"))
-    .WithReference(database);
-
-if (plantConflict)
-{
-    var conflict = builder.AddDotnetProject(
-            "conflict",
-            "../Api/Todo.Api.csproj",
-            options => options.ExcludeLaunchProfile = true)
-        .WithArgs(context => context.Args.Add("plant-migration-conflict"))
-        .WithReference(database)
-        .WaitFor(database);
-
-    migrate = migrate.WaitForCompletion(conflict);
-}
-else
-{
-    migrate = migrate.WaitFor(database);
-}
+    .WithReference(database)
+    .WaitFor(database);
 
 if (holdMigrate)
 {

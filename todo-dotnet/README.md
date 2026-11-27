@@ -37,8 +37,9 @@ The API reads Aspire-injected connection strings and optional build identity:
 | `BuildCommit` | Reported by `/version` | `unknown` |
 | `HOSTNAME` | Replica identity (`replica` field and `X-Served-By`) | machine hostname; empty omits both |
 
-A missing connection string is named in the failure; its value never appears in a
-message or log.
+`migrate` names a missing `ConnectionStrings:tododb` in its failure message (the
+value is never logged). The running API reports missing or unhealthy dependencies
+via `GET /health`.
 
 | Request | What it does |
 | --- | --- |
