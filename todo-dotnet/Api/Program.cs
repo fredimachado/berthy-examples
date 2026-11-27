@@ -12,6 +12,15 @@ if (args is ["migrate"])
     return await MigrateCommand.RunAsync(migrateConfig, CancellationToken.None);
 }
 
+if (args is ["plant-migration-conflict"])
+{
+    var conflictConfig = new ConfigurationBuilder()
+        .AddEnvironmentVariables()
+        .AddCommandLine(args)
+        .Build();
+    return await MigrateCommand.PlantConflictAsync(conflictConfig, CancellationToken.None);
+}
+
 var builder = WebApplication.CreateBuilder(args);
 
 var hostName = ResolveHostName(builder.Configuration);
