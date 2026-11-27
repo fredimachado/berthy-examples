@@ -127,42 +127,50 @@ if (!string.IsNullOrWhiteSpace(tododb))
     app.MapPost("/api/todos", TodoCommands.CreateTodoAsync);
     app.MapMethods("/api/todos/{id}", ["PATCH"], TodoCommands.PatchTodoAsync);
     app.MapDelete("/api/todos/{id}", TodoCommands.DeleteTodoAsync);
-
-    app.MapGet("/health", async (TodoDbContext db, IServiceProvider sp, CancellationToken ct) =>
-    {
-        var mux = sp.GetService<IConnectionMultiplexer>();
-        var probes = new DependencyProbe[]
-        {
-            new("postgres", async token =>
-            {
-                await db.Database.ExecuteSqlRawAsync("SELECT 1", token);
-            }),
-            new("redis", async token =>
-            {
-                if (mux is null)
-                {
-                    throw new InvalidOperationException("redis is not configured");
-                }
-
-                // PingAsync ignores cancellation; the shared WaitAsync deadline still bounds the wait.
-                token.ThrowIfCancellationRequested();
-                await mux.GetDatabase().PingAsync();
-                token.ThrowIfCancellationRequested();
-            }),
-        };
-
-        var failed = await DependencyHealth.FailedDependenciesAsync(probes, TimeProvider.System, ct);
-        if (failed.Length == 0)
-        {
-            return Results.Json(new HealthOkResponse("ok"), AppJson.Options);
-        }
-
-        return Results.Json(
-            new HealthUnavailableResponse("unavailable", failed),
-            AppJson.Options,
-            statusCode: StatusCodes.Status503ServiceUnavailable);
-    });
 }
+
+// Always register /health so a missing tododb still reports postgres as failed.
+app.MapGet("/health", async (IServiceProvider sp, CancellationToken ct) =>
+{
+    var probes = new DependencyProbe[]
+    {
+        new("postgres", async token =>
+        {
+            // Own a scope/context through query completion so request disposal cannot cut it short.
+            await using var scope = sp.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetService<TodoDbContext>()
+                ?? throw new InvalidOperationException("postgres is not configured");
+            await db.Database.ExecuteSqlRawAsync("SELECT 1", token);
+        }),
+        new("redis", async token =>
+        {
+            // ConnectAsync inside the probe so a cold sync Connect cannot starve postgres or the deadline.
+            var redisCs = sp.GetRequiredService<IConfiguration>().GetConnectionString("redis");
+            if (string.IsNullOrWhiteSpace(redisCs))
+            {
+                throw new InvalidOperationException("redis is not configured");
+            }
+
+            var options = ConfigurationOptions.Parse(redisCs);
+            options.AbortOnConnectFail = false;
+            await using var mux = await ConnectionMultiplexer.ConnectAsync(options);
+            token.ThrowIfCancellationRequested();
+            await mux.GetDatabase().PingAsync();
+            token.ThrowIfCancellationRequested();
+        }),
+    };
+
+    var failed = await DependencyHealth.FailedDependenciesAsync(probes, TimeProvider.System, ct);
+    if (failed.Length == 0)
+    {
+        return Results.Json(new HealthOkResponse("ok"), AppJson.Options);
+    }
+
+    return Results.Json(
+        new HealthUnavailableResponse("unavailable", failed),
+        AppJson.Options,
+        statusCode: StatusCodes.Status503ServiceUnavailable);
+});
 
 app.MapFallback(() => JsonError.Write(StatusCodes.Status404NotFound, "not found"));
 

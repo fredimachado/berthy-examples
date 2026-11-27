@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.Net;
+using System.Net.Sockets;
 using System.Text.Json;
 using Microsoft.Extensions.Time.Testing;
 
@@ -155,6 +157,125 @@ public sealed class HealthTests
         clock.Advance(TimeSpan.FromSeconds(2));
         failed = await healthTask.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(new[] { "redis" }, failed);
+    }
+
+    [Fact]
+    public async Task HealthFirstRequestWithPendingRedisStillProbesPostgres()
+    {
+        await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
+        Assert.Equal(0, (await MigrateProcess.RunAsync(database.ConnectionString)).ExitCode);
+
+        // Accept TCP but never complete the Redis handshake so ConnectAsync stays pending.
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var acceptLoop = AcceptAndHoldAsync(listener);
+
+        await using var factory = CreateFactory(database.ConnectionString, $"localhost:{port}");
+        var client = factory.CreateClient();
+
+        var sw = Stopwatch.StartNew();
+        using var response = await client.GetAsync("/health");
+        sw.Stop();
+
+        Assert.True(
+            sw.Elapsed < TimeSpan.FromSeconds(5),
+            $"cold Redis connect starved the health deadline: {sw.Elapsed}");
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        AssertFailed(await response.Content.ReadAsStringAsync(), "redis");
+
+        listener.Stop();
+        try
+        {
+            await acceptLoop.WaitAsync(TimeSpan.FromSeconds(1));
+        }
+        catch (Exception)
+        {
+            // Listener stopped; accept loop may fault.
+        }
+    }
+
+    [Fact]
+    public async Task HealthDeadlineDoesNotAwaitHeldCancellationCallbacks()
+    {
+        var clock = new FakeTimeProvider();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseCallback = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var callbackEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        async Task HangWithHeldCancelAsync(CancellationToken ct)
+        {
+            ct.Register(() =>
+            {
+                callbackEntered.TrySetResult();
+                // Blocks Cancel/CancelAsync until released — must not stall the response path.
+                releaseCallback.Task.GetAwaiter().GetResult();
+            });
+            started.TrySetResult();
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+        }
+
+        var probes = new DependencyProbe[]
+        {
+            new("postgres", HangWithHeldCancelAsync),
+            new("redis", async _ => await Task.CompletedTask),
+        };
+
+        var healthTask = DependencyHealth.FailedDependenciesAsync(probes, clock, CancellationToken.None);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        clock.Advance(TimeSpan.FromSeconds(2));
+
+        var failed = await healthTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(new[] { "postgres" }, failed);
+
+        // Callback may still be held; releasing cleans up the background cancel path.
+        await callbackEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        releaseCallback.TrySetResult();
+    }
+
+    [Fact]
+    public async Task HealthWithoutTododbReportsPostgresFailed()
+    {
+        await using var factory = new ApiFactory(
+            new Dictionary<string, string?>
+            {
+                ["ConnectionStrings:redis"] = _services.RedisConnectionString,
+                ["BuildVersion"] = "v-health",
+                ["BuildCommit"] = "health-test",
+                ["HOSTNAME"] = "health-replica",
+            });
+        var client = factory.CreateClient();
+
+        using var response = await client.GetAsync("/health");
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        Assert.Equal("health-replica", response.Headers.GetValues("X-Served-By").Single());
+        AssertFailed(await response.Content.ReadAsStringAsync(), "postgres");
+    }
+
+    private static async Task AcceptAndHoldAsync(TcpListener listener)
+    {
+        try
+        {
+            while (true)
+            {
+                var client = await listener.AcceptTcpClientAsync();
+                // Leave the socket open with no Redis reply so the handshake stalls.
+                _ = client;
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        catch (SocketException)
+        {
+        }
     }
 
     private static ApiFactory CreateFactory(string postgres, string redis) =>

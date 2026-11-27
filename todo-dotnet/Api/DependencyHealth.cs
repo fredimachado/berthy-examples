@@ -11,8 +11,10 @@ internal static class DependencyHealth
     internal static async Task<string[]> FailedDependenciesAsync(
         IReadOnlyList<DependencyProbe> probes, TimeProvider clock, CancellationToken ct)
     {
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        // Start the shared deadline before any probe work so cold connects cannot steal budget.
+        var deadlineTask = Task.Delay(Deadline, clock, ct);
 
+        var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var failed = new bool[probes.Count];
         var tasks = new Task[probes.Count];
         for (var i = 0; i < probes.Count; i++)
@@ -23,14 +25,11 @@ internal static class DependencyHealth
         }
 
         var probeTask = Task.WhenAll(tasks);
-        // One shared deadline via TimeProvider so a fake clock advances all probes together.
-        // Also bounds drivers that ignore cancellation of an issued command.
-        var deadlineTask = Task.Delay(Deadline, clock, ct);
         var completed = await Task.WhenAny(probeTask, deadlineTask);
 
         if (completed == deadlineTask)
         {
-            await linked.CancelAsync();
+            // Capture unfinished probes before any cancellation work.
             for (var i = 0; i < tasks.Length; i++)
             {
                 if (!tasks[i].IsCompletedSuccessfully)
@@ -39,13 +38,21 @@ internal static class DependencyHealth
                 }
             }
 
-            // Keep driver work bounded for the caller; still observe later completions.
-            _ = ObserveLaterAsync(tasks);
+            // Cancel and dispose off the response path — CancelAsync waits for callbacks.
+            var toCleanup = linked;
+            linked = null!;
+            _ = CleanupAfterDeadlineAsync(toCleanup, tasks);
         }
         else
         {
-            // ProbeAsync records failures itself; WhenAll should not fault.
-            await probeTask;
+            try
+            {
+                await probeTask;
+            }
+            finally
+            {
+                linked.Dispose();
+            }
         }
 
         var names = new List<string>(probes.Count);
@@ -73,15 +80,28 @@ internal static class DependencyHealth
         }
     }
 
-    private static async Task ObserveLaterAsync(Task[] tasks)
-    {
-        try
+    private static Task CleanupAfterDeadlineAsync(CancellationTokenSource cts, Task[] tasks) =>
+        Task.Run(async () =>
         {
-            await Task.WhenAll(tasks);
-        }
-        catch (Exception)
-        {
-            // Failures were already recorded for the response; ignore late faults.
-        }
-    }
+            try
+            {
+                // Runs on the thread pool so a held cancel callback cannot stall the HTTP response.
+                await cts.CancelAsync();
+            }
+            catch (Exception)
+            {
+            }
+
+            try
+            {
+                await Task.WhenAll(tasks);
+            }
+            catch (Exception)
+            {
+            }
+            finally
+            {
+                cts.Dispose();
+            }
+        });
 }
