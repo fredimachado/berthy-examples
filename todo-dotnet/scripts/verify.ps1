@@ -12,6 +12,8 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 Set-StrictMode -Version Latest
 
+. (Join-Path $PSScriptRoot 'ProcessStreamDrain.ps1')
+
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot '..\..')
 $todoAppHost = (Resolve-Path (Join-Path $repoRoot 'todo-dotnet\AppHost\apphost.cs')).Path
 $smokeScript = Join-Path $PSScriptRoot 'smoke.ps1'
@@ -286,7 +288,7 @@ function Invoke-PublishedWeb {
     $pgPort = Get-FreeTcpPort
     $redisPort = Get-FreeTcpPort
     $apiProcess = $null
-    $drainPowerShells = @()
+    $drainJobs = @()
     $runError = $null
     $cleanupError = $null
     $replica = 'verify-published'
@@ -352,7 +354,7 @@ function Invoke-PublishedWeb {
 
         Write-Host "Starting published API on http://127.0.0.1:0"
         # ProcessStartInfo.Environment (not Start-Process -Environment) keeps PS < 7.4 working.
-        # Dedicated drain runspaces keep reading until EOF so redirected pipes cannot fill during Playwright.
+        # ProcessStreamDrain.ps1 keeps reading until EOF so redirected pipes cannot fill during Playwright.
         $info = [System.Diagnostics.ProcessStartInfo]::new()
         $info.FileName = 'dotnet'
         $info.ArgumentList.Add('Todo.Api.dll')
@@ -374,78 +376,13 @@ function Invoke-PublishedWeb {
             throw 'Failed to start published Todo.Api.dll.'
         }
 
-        $streamState = [hashtable]::Synchronized(@{
-                Url      = $null
-                Captured = [System.Text.StringBuilder]::new()
-                MaxChars = 65536
-                Gate     = [object]::new()
-            })
-
-        $drainScript = {
-            param(
-                [System.IO.StreamReader] $Reader,
-                [hashtable] $State
-            )
-            try {
-                while ($null -ne ($line = $Reader.ReadLine())) {
-                    if ($null -eq $State['Url'] -and $line -match 'Now listening on:\s*(https?://\S+)') {
-                        $State['Url'] = $Matches[1].TrimEnd('/')
-                    }
-
-                    $gate = $State['Gate']
-                    [System.Threading.Monitor]::Enter($gate)
-                    try {
-                        $captured = $State['Captured']
-                        $maxChars = [int]$State['MaxChars']
-                        if ($captured.Length -ge $maxChars) {
-                            continue
-                        }
-
-                        $chunk = $line + [Environment]::NewLine
-                        $room = $maxChars - $captured.Length
-                        if ($chunk.Length -gt $room) {
-                            $chunk = $chunk.Substring(0, $room)
-                        }
-                        [void]$captured.Append($chunk)
-                    }
-                    finally {
-                        [System.Threading.Monitor]::Exit($gate)
-                    }
-                }
-            }
-            catch {
-                # Stream closes when the process exits; drain runspace ends.
-            }
-        }
-
-        foreach ($reader in @($apiProcess.StandardOutput, $apiProcess.StandardError)) {
-            $ps = [powershell]::Create()
-            [void]$ps.AddScript($drainScript).AddArgument($reader).AddArgument($streamState)
-            [void]$ps.BeginInvoke()
-            $drainPowerShells += $ps
-        }
-
-        $listenUrl = $null
-        $deadline = [DateTime]::UtcNow + [TimeSpan]::FromMinutes(1)
-        while ([DateTime]::UtcNow -lt $deadline -and -not $listenUrl) {
-            $listenUrl = $streamState['Url']
-            if ($listenUrl) { break }
-
-            if ($apiProcess.HasExited) {
-                Start-Sleep -Milliseconds 100
-                $listenUrl = $streamState['Url']
-                if (-not $listenUrl) {
-                    throw "Published API exited before listening (code $($apiProcess.ExitCode)). captured=$($streamState['Captured'])"
-                }
-                break
-            }
-
-            Start-Sleep -Milliseconds 50
-        }
-
-        if (-not $listenUrl) {
-            throw "Timed out waiting for published Kestrel listen URL. captured=$($streamState['Captured'])"
-        }
+        $streamState = New-StreamDrainState
+        $drainJobs = Start-StreamDrain -Process $apiProcess -State $streamState
+        $listenUrl = Wait-StreamDrainListenUrl `
+            -Process $apiProcess `
+            -State $streamState `
+            -DrainJobs $drainJobs `
+            -Deadline ([DateTime]::UtcNow.AddMinutes(1))
 
         Write-Host "Published API listening at $listenUrl"
         Wait-HttpOk -Url "$listenUrl/health" -Timeout ([TimeSpan]::FromMinutes(1))
@@ -512,14 +449,11 @@ function Invoke-PublishedWeb {
             if ($null -ne $apiProcess) { $apiProcess.Dispose() }
         }
 
-        foreach ($ps in $drainPowerShells) {
-            try {
-                $ps.Stop()
-                $ps.Dispose()
-            }
-            catch {
-                if ($null -eq $cleanupError) { $cleanupError = $_ }
-            }
+        try {
+            Stop-StreamDrain -DrainJobs $drainJobs
+        }
+        catch {
+            if ($null -eq $cleanupError) { $cleanupError = $_ }
         }
 
         foreach ($name in @($pgName, $redisName)) {
