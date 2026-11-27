@@ -273,11 +273,18 @@ public sealed class PublishTests
             try
             {
                 Environment.SetEnvironmentVariable("TODO_BASE_URL", baseUrl.TrimEnd('/'));
-                var e2e = await RunProcessAsync(
-                    "npm",
-                    ["--prefix", WebDir, "run", "test:e2e"],
-                    RepoRoot,
-                    cts.Token);
+                // Windows .cmd shims need cmd.exe /c; bare ProcessStartInfo("npm.cmd") mis-resolves.
+                var e2e = OperatingSystem.IsWindows()
+                    ? await RunProcessAsync(
+                        "cmd.exe",
+                        ["/c", "npm", "--prefix", WebDir, "run", "test:e2e"],
+                        RepoRoot,
+                        cts.Token)
+                    : await RunProcessAsync(
+                        "npm",
+                        ["--prefix", WebDir, "run", "test:e2e"],
+                        RepoRoot,
+                        cts.Token);
                 Assert.True(
                     e2e.ExitCode == 0,
                     $"Playwright against published app failed ({e2e.ExitCode}): {e2e.StdErr}\n{e2e.StdOut}");
