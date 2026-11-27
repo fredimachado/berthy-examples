@@ -79,10 +79,15 @@ try {
         throw "aspire start path '$($started.appHostPath)' does not match owned AppHost '$todoAppHost'."
     }
 
-    $todoAppHostPid = [int]$started.appHostPid
-    if ($todoAppHostPid -le 0) {
-        throw "aspire start returned non-positive appHostPid: $($started.appHostPid)"
+    $rawPid = $started.appHostPid
+    if ($null -eq $rawPid -or [string]::IsNullOrWhiteSpace([string]$rawPid)) {
+        throw "aspire start JSON missing appHostPid: $startJson"
     }
+    $parsedPid = 0
+    if (-not [int]::TryParse([string]$rawPid, [ref]$parsedPid) -or $parsedPid -le 0) {
+        throw "aspire start returned non-positive appHostPid: $rawPid"
+    }
+    $todoAppHostPid = $parsedPid
     Write-Host "Owned AppHost PID: $todoAppHostPid"
 
     aspire wait api --status healthy --apphost $todoAppHost --non-interactive --nologo | Out-Host
@@ -110,6 +115,10 @@ finally {
             $cleanupError = $_
         }
     }
+}
+
+if ($null -ne $cleanupError -and $null -ne $runError) {
+    throw "verify failed with run error and AppHost cleanup failure.`nRun error: $runError`nCleanup error: $cleanupError"
 }
 
 if ($null -ne $cleanupError) {
