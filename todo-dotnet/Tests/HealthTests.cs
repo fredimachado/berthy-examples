@@ -191,12 +191,9 @@ public sealed class HealthTests
         Task PostgresBlocksSynchronouslyBeforeAwait(CancellationToken ct)
         {
             postgresHolding.TrySetResult();
-            // Sync hold before any await — concurrent scheduling must start redis while we wait.
-            if (!holdPostgres.Wait(TimeSpan.FromSeconds(10), ct))
-            {
-                throw new TimeoutException("Postgres sync hold timed out.");
-            }
-
+            // Unbounded hold (ct only): a sequential scheduler must fail the Redis wait below,
+            // not sneak through after a timed-out Postgres probe.
+            holdPostgres.Wait(ct);
             return Task.CompletedTask;
         }
 
@@ -279,14 +276,14 @@ public sealed class HealthTests
     {
         // Clock advances past the deadline while the deadline timer callback is held, so the
         // deadline loop cannot mark Pending→Failed yet. Postgres's late success must fail the
-        // elapsed-time check in TryRecordSuccess specifically.
+        // elapsed-time check in TryRecordSuccess specifically — WhenAll can finish while the
+        // timer is still held; without the elapsed check the failure list would be empty.
         using var holdTimerCallbacks = new ManualResetEventSlim(false);
         var timerCallbackEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var clock = new HoldableFakeTimeProvider(holdTimerCallbacks, timerCallbackEntered);
         var redisRecorded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var allowPostgresFinish = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var postgresCheckReturned = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var postgresSucceededInBudget = 0;
+        Task? advanceTask = null;
 
         Task RedisOkFirstAsync(CancellationToken ct) => Task.CompletedTask;
 
@@ -295,7 +292,6 @@ public sealed class HealthTests
             await redisRecorded.Task.WaitAsync(ct);
             await allowPostgresFinish.Task.WaitAsync(ct);
             await Task.CompletedTask;
-            postgresCheckReturned.TrySetResult();
         }
 
         var probes = new DependencyProbe[]
@@ -314,10 +310,6 @@ public sealed class HealthTests
                 {
                     redisRecorded.TrySetResult();
                 }
-                else if (name == "postgres")
-                {
-                    Interlocked.Exchange(ref postgresSucceededInBudget, 1);
-                }
             });
 
         try
@@ -326,27 +318,23 @@ public sealed class HealthTests
 
             var startedAt = clock.GetTimestamp();
             // Advance on a worker: time moves forward, then the deadline timer callback blocks.
-            var advanceTask = Task.Run(() => clock.Advance(DependencyHealth.Deadline), CancellationToken.None);
+            advanceTask = Task.Run(() => clock.Advance(DependencyHealth.Deadline), CancellationToken.None);
             await timerCallbackEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
             Assert.True(clock.GetElapsedTime(startedAt) >= DependencyHealth.Deadline);
 
-            // Late success while deadline path is still blocked on the held timer callback.
+            // Late success while deadline path is still blocked; await health before releasing.
             allowPostgresFinish.TrySetResult();
-            await postgresCheckReturned.Task.WaitAsync(TimeSpan.FromSeconds(5));
-            await Task.Yield();
-            Assert.Equal(0, Volatile.Read(ref postgresSucceededInBudget));
-
-            holdTimerCallbacks.Set();
-            await advanceTask.WaitAsync(TimeSpan.FromSeconds(5));
-
             var failed = await healthTask.WaitAsync(TimeSpan.FromSeconds(5));
             Assert.Equal(new[] { "postgres" }, failed);
-            Assert.Equal(0, Volatile.Read(ref postgresSucceededInBudget));
         }
         finally
         {
             allowPostgresFinish.TrySetResult();
             holdTimerCallbacks.Set();
+            if (advanceTask is not null)
+            {
+                await advanceTask.WaitAsync(TimeSpan.FromSeconds(5));
+            }
         }
     }
 
