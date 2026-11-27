@@ -4,6 +4,8 @@
     <TargetFramework>net11.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <SpaRoot>$(MSBuildThisFileDirectory)..\web\</SpaRoot>
+    <SpaDist>$(SpaRoot)dist\</SpaDist>
   </PropertyGroup>
 
   <ItemGroup>
@@ -20,5 +22,21 @@
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.3" />
     <PackageReference Include="StackExchange.Redis" Version="2.8.31" />
   </ItemGroup>
+
+  <!-- Publish only: locked npm install + Vite build. Ordinary build/test stay Node-free. -->
+  <Target Name="PublishFrontend" BeforeTargets="ComputeFilesToPublish" Condition="'$(SkipFrontendBuild)' != 'true'">
+    <Message Importance="High" Text="Building frontend from $(SpaRoot) for publish wwwroot..." />
+    <Exec WorkingDirectory="$(SpaRoot)" Command="npm ci" />
+    <Exec WorkingDirectory="$(SpaRoot)" Command="npm run build" />
+    <!-- Evaluate hashed asset names after the Vite build so a clean first publish includes them. -->
+    <ItemGroup>
+      <_SpaDistFiles Include="$(SpaDist)**\*" />
+      <ResolvedFileToPublish Include="@(_SpaDistFiles)">
+        <RelativePath>wwwroot\%(_SpaDistFiles.RecursiveDir)%(_SpaDistFiles.Filename)%(_SpaDistFiles.Extension)</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+        <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+      </ResolvedFileToPublish>
+    </ItemGroup>
+  </Target>
 
 </Project>

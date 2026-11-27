@@ -2,6 +2,7 @@ using System.Net;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.FileProviders;
 
 if (args is ["migrate"])
 {
@@ -100,6 +101,26 @@ app.Use(async (context, next) =>
     }
 
     await next();
+});
+
+// Serve the published Vite SPA from wwwroot. Keep MapFallback as JSON 404 —
+// never fall back unknown API/asset paths to index.html.
+// Rebuild the file provider from WebRootPath so test hosts that call UseWebRoot
+// after the default wwwroot provider was created still serve the staged SPA.
+var webRootPath = app.Environment.WebRootPath;
+if (!string.IsNullOrWhiteSpace(webRootPath) && Directory.Exists(webRootPath))
+{
+    var webFiles = new PhysicalFileProvider(webRootPath);
+    app.UseDefaultFiles(new DefaultFilesOptions { FileProvider = webFiles });
+    app.UseStaticFiles(new StaticFileOptions { FileProvider = webFiles });
+}
+
+app.MapGet("/", (IWebHostEnvironment env) =>
+{
+    var index = Path.Combine(env.WebRootPath ?? "", "index.html");
+    return File.Exists(index)
+        ? Results.File(index, contentType: "text/html")
+        : JsonError.Write(StatusCodes.Status404NotFound, "not found");
 });
 
 app.MapGet("/version", () => Results.Json(build, AppJson.Options));
