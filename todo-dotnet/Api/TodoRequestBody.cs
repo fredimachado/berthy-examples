@@ -28,6 +28,7 @@ internal static class TodoRequestBody
 
     /// <summary>
     /// Shared object-or-null envelope for create and patch; <paramref name="readObject"/> owns fields.
+    /// Validates one complete JSON value (syntax + trailing data) before field typing, matching Go Decode.
     /// </summary>
     private static async Task<(T? Body, IResult? Error)> ReadTopLevelAsync<T>(
         HttpRequest request,
@@ -42,20 +43,62 @@ internal static class TodoRequestBody
             return (null, error);
         }
 
+        var span = buffer.AsSpan(0, total);
+
+        // Phase 1: whole-value syntax (and trailing data) before any field-type message.
         try
         {
-            var reader = new Utf8JsonReader(buffer.AsSpan(0, total));
-            if (!reader.Read())
+            var validate = new Utf8JsonReader(span);
+            if (!JsonDocument.TryParseValue(ref validate, out var doc))
             {
-                return (null, JsonError.Write(StatusCodes.Status400BadRequest, "invalid JSON: the body is empty"));
+                return (null, JsonError.Write(
+                    StatusCodes.Status400BadRequest,
+                    "invalid JSON: the body is empty"));
             }
 
-            T body;
+            using (doc)
+            {
+                try
+                {
+                    if (validate.Read())
+                    {
+                        return (null, JsonError.Write(
+                            StatusCodes.Status400BadRequest,
+                            "invalid JSON: unexpected data after the JSON object"));
+                    }
+                }
+                catch (JsonException)
+                {
+                    return (null, JsonError.Write(
+                        StatusCodes.Status400BadRequest,
+                        "invalid JSON: unexpected data after the JSON object"));
+                }
+            }
+        }
+        catch (JsonException)
+        {
+            return (null, JsonError.Write(
+                StatusCodes.Status400BadRequest,
+                "invalid JSON: syntax error"));
+        }
+
+        // Phase 2: semantic object/null decode (Go UnmarshalTypeError for other top-level values).
+        try
+        {
+            var reader = new Utf8JsonReader(span);
+            if (!reader.Read())
+            {
+                return (null, JsonError.Write(
+                    StatusCodes.Status400BadRequest,
+                    "invalid JSON: the body is empty"));
+            }
+
             if (reader.TokenType == JsonTokenType.Null)
             {
-                body = emptyFromNull();
+                return (emptyFromNull(), null);
             }
-            else if (reader.TokenType == JsonTokenType.StartObject)
+
+            if (reader.TokenType == JsonTokenType.StartObject)
             {
                 var (parsed, parseError) = readObject(ref reader);
                 if (parseError is not null)
@@ -63,16 +106,13 @@ internal static class TodoRequestBody
                     return (null, parseError);
                 }
 
-                body = parsed!;
-            }
-            else
-            {
-                return (null, JsonError.Write(
-                    StatusCodes.Status400BadRequest,
-                    "invalid JSON: expected an object or null"));
+                return (parsed, null);
             }
 
-            return FinishObjectOrNull(ref reader, body);
+            // Arrays/scalars into a struct → field "" (Go UnmarshalTypeError.Field).
+            return (null, JsonError.Write(
+                StatusCodes.Status400BadRequest,
+                "invalid JSON: field \"\" has the wrong type"));
         }
         catch (JsonException)
         {
@@ -114,29 +154,6 @@ internal static class TodoRequestBody
         }
 
         return (buffer, total, null);
-    }
-
-    private static (T? Body, IResult? Error) FinishObjectOrNull<T>(ref Utf8JsonReader reader, T body)
-        where T : class
-    {
-        try
-        {
-            if (reader.Read())
-            {
-                return (null, JsonError.Write(
-                    StatusCodes.Status400BadRequest,
-                    "invalid JSON: unexpected data after the JSON object"));
-            }
-        }
-        catch (JsonException)
-        {
-            // Trailing junk that fails to tokenize still matches Go's trailing-data rejection.
-            return (null, JsonError.Write(
-                StatusCodes.Status400BadRequest,
-                "invalid JSON: unexpected data after the JSON object"));
-        }
-
-        return (body, null);
     }
 
     /// <summary>

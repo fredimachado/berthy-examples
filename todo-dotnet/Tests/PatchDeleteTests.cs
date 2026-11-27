@@ -298,6 +298,60 @@ public sealed class PatchDeleteTests
     }
 
     [Fact]
+    public async Task PatchArrayBodyHasEmptyFieldWrongType()
+    {
+        // Go Decode into struct: top-level array → UnmarshalTypeError with Field "".
+        await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
+        Assert.Equal(0, (await MigrateProcess.RunAsync(database.ConnectionString)).ExitCode);
+
+        var seedId = await SeedTodoAsync(
+            database.ConnectionString,
+            title: "array-body",
+            done: false,
+            createdAt: DateTimeOffset.UtcNow,
+            updatedAt: DateTimeOffset.UtcNow);
+
+        await using var factory = CreateFactory(database.ConnectionString, replica: "");
+        var client = factory.CreateClient();
+        var before = await ReadTodoAsync(database.ConnectionString, seedId);
+
+        using var response = await PatchJsonAsync(client, seedId, "[]");
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        await AssertExactJsonErrorAsync(response, """invalid JSON: field "" has the wrong type""");
+
+        var after = await ReadTodoAsync(database.ConnectionString, seedId);
+        Assert.Equal(before.UpdatedAt, after.UpdatedAt);
+        Assert.False(after.Done);
+    }
+
+    [Fact]
+    public async Task PatchTrailingCommaIsSyntaxErrorNotWrongType()
+    {
+        // Syntax is checked before field types so {"done":"yes",} is not a done-type error.
+        await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
+        Assert.Equal(0, (await MigrateProcess.RunAsync(database.ConnectionString)).ExitCode);
+
+        var seedId = await SeedTodoAsync(
+            database.ConnectionString,
+            title: "comma-body",
+            done: false,
+            createdAt: DateTimeOffset.UtcNow,
+            updatedAt: DateTimeOffset.UtcNow);
+
+        await using var factory = CreateFactory(database.ConnectionString, replica: "");
+        var client = factory.CreateClient();
+        var before = await ReadTodoAsync(database.ConnectionString, seedId);
+
+        using var response = await PatchJsonAsync(client, seedId, """{"done":"yes",}""");
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        await AssertExactJsonErrorAsync(response, "invalid JSON: syntax error");
+
+        var after = await ReadTodoAsync(database.ConnectionString, seedId);
+        Assert.Equal(before.UpdatedAt, after.UpdatedAt);
+        Assert.False(after.Done);
+    }
+
+    [Fact]
     public async Task DeleteRemovesExactlyOneRow()
     {
         await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
