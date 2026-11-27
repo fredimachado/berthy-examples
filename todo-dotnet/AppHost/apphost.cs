@@ -1,5 +1,6 @@
 #:package Aspire.Hosting.AppHost@17.0.0
 #:package Aspire.Hosting.Dotnet@17.0.0
+#:package Aspire.Hosting.JavaScript@17.0.0
 #:package Aspire.Hosting.PostgreSQL@17.0.0
 #:package Aspire.Hosting.Redis@17.0.0
 
@@ -50,11 +51,17 @@ if (holdMigrate)
     migrate = migrate.WithExplicitStart();
 }
 
-builder.AddDotnetProject("api", "../Api/Todo.Api.csproj")
+var api = builder.AddDotnetProject("api", "../Api/Todo.Api.csproj")
     .WithReference(database)
     .WithReference(redis)
     .WaitForCompletion(migrate)
     .WaitFor(redis)
     .WithHttpHealthCheck("/health");
+
+builder.AddViteApp("web", "../web")
+    .WithReference(api)
+    .WithEnvironment("API_HTTP", api.GetEndpoint("http"))
+    .WithHttpHealthCheck("/")
+    .WaitFor(api);
 
 builder.Build().Run();

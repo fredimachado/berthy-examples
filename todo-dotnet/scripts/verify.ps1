@@ -1,7 +1,7 @@
 #Requires -Version 7
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Api')]
+    [ValidateSet('Api', 'AspireWeb')]
     [string] $Target
 )
 
@@ -12,6 +12,7 @@ Set-StrictMode -Version Latest
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot '..\..')
 $todoAppHost = (Resolve-Path (Join-Path $repoRoot 'todo-dotnet\AppHost\apphost.cs')).Path
 $smokeScript = Join-Path $PSScriptRoot 'smoke.ps1'
+$webDir = Join-Path $repoRoot 'todo-dotnet\web'
 
 function Normalize-AppHostPath([string] $path) {
     return [System.IO.Path]::GetFullPath($path).TrimEnd('\', '/').ToLowerInvariant()
@@ -23,8 +24,15 @@ function Assert-NativeExit([string] $commandName) {
     }
 }
 
-function Get-ApiHttpUrl([string] $apphost) {
-    $describeJson = aspire describe api --format Json --apphost $apphost --non-interactive --nologo | Out-String
+function Get-ResourceHttpUrl {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Apphost,
+        [Parameter(Mandatory = $true)]
+        [string] $DisplayName
+    )
+
+    $describeJson = aspire describe $DisplayName --format Json --apphost $Apphost --non-interactive --nologo | Out-String
     Assert-NativeExit 'aspire describe'
     $snapshot = $describeJson | ConvertFrom-Json
     $resources = @()
@@ -35,13 +43,15 @@ function Get-ApiHttpUrl([string] $apphost) {
         $resources = @($snapshot)
     }
 
-    # Isolated starts suffix the resource name (api-xxxxxx); displayName stays "api".
+    # Isolated starts suffix the resource name (api-xxxxxx); displayName stays stable.
     $resource = $resources | Where-Object {
-        [string]$_.displayName -eq 'api' -or [string]$_.name -eq 'api' -or [string]$_.name -like 'api-*'
+        [string]$_.displayName -eq $DisplayName -or
+        [string]$_.name -eq $DisplayName -or
+        [string]$_.name -like "$DisplayName-*"
     } | Select-Object -First 1
 
     if (-not $resource) {
-        throw "aspire describe api returned no api resource: $describeJson"
+        throw "aspire describe $DisplayName returned no matching resource: $describeJson"
     }
 
     $urls = @($resource.urls)
@@ -51,15 +61,15 @@ function Get-ApiHttpUrl([string] $apphost) {
     }
 
     if (-not $http) {
-        throw "api resource has no http endpoint: $describeJson"
+        throw "$DisplayName resource has no http endpoint: $describeJson"
     }
 
-    $apiUrl = [string]$http.url
-    if ([string]::IsNullOrWhiteSpace($apiUrl)) {
-        throw "api http endpoint URL is empty: $describeJson"
+    $url = [string]$http.url
+    if ([string]::IsNullOrWhiteSpace($url)) {
+        throw "$DisplayName http endpoint URL is empty: $describeJson"
     }
 
-    return $apiUrl.TrimEnd('/')
+    return $url.TrimEnd('/')
 }
 
 $todoAppHostPid = $null
@@ -91,14 +101,36 @@ try {
     Write-Host "Owned AppHost PID: $todoAppHostPid"
 
     aspire wait api --status healthy --apphost $todoAppHost --non-interactive --nologo | Out-Host
-    Assert-NativeExit 'aspire wait'
+    Assert-NativeExit 'aspire wait api'
 
-    $apiUrl = Get-ApiHttpUrl $todoAppHost
-    Write-Host "API http endpoint: $apiUrl"
+    if ($Target -eq 'Api') {
+        $apiUrl = Get-ResourceHttpUrl -Apphost $todoAppHost -DisplayName 'api'
+        Write-Host "API http endpoint: $apiUrl"
 
-    & $smokeScript -ApiUrl $apiUrl
-    if ($LASTEXITCODE -ne 0) {
-        throw "smoke.ps1 failed with exit code $LASTEXITCODE"
+        & $smokeScript -ApiUrl $apiUrl
+        if ($LASTEXITCODE -ne 0) {
+            throw "smoke.ps1 failed with exit code $LASTEXITCODE"
+        }
+    }
+    elseif ($Target -eq 'AspireWeb') {
+        aspire wait web --status healthy --apphost $todoAppHost --non-interactive --nologo | Out-Host
+        Assert-NativeExit 'aspire wait web'
+
+        $webUrl = Get-ResourceHttpUrl -Apphost $todoAppHost -DisplayName 'web'
+        Write-Host "Web http endpoint: $webUrl"
+
+        $env:TODO_BASE_URL = $webUrl
+        Push-Location $webDir
+        try {
+            npm --prefix $webDir run test:e2e
+            if ($LASTEXITCODE -ne 0) {
+                throw "npm run test:e2e failed with exit code $LASTEXITCODE"
+            }
+        }
+        finally {
+            Pop-Location
+            Remove-Item Env:TODO_BASE_URL -ErrorAction SilentlyContinue
+        }
     }
 }
 catch {
