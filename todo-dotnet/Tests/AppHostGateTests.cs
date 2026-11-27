@@ -13,11 +13,12 @@ public sealed class AppHostGateTests
         Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "AppHost", "apphost.cs"));
 
     [Fact]
-    public async Task ColdStartWaitsForDatabaseThenMigration()
+    public async Task HeldMigrateBlocksApiUntilSuccessfulExit()
     {
         using var cts = new CancellationTokenSource(Timeout);
 
-        // Hold migrate at a test-controlled point: AppHost uses WithExplicitStart on migrate.
+        // Proves: held migrate → API blocked → migrate exit 0 → API serves [].
+        // migrate.WaitFor(database) is pinned by AppHost source review in apphost.cs, not this test.
         await using var host = await AspireHost.StartAsync(
             AppHostPath,
             cts.Token,
@@ -26,7 +27,6 @@ public sealed class AppHostGateTests
         await host.WaitAsync("tododb", "healthy", cts.Token);
         await host.WaitAsync("redis", "healthy", cts.Token);
 
-        // While migrate is held, WaitForCompletion must keep the API from serving.
         await AssertApiDoesNotAcceptAsync(host, TimeSpan.FromSeconds(15), cts.Token);
         var heldMigrate = await host.GetResourceAsync("migrate", cts.Token);
         Assert.True(
@@ -36,7 +36,6 @@ public sealed class AppHostGateTests
             heldMigrate.ExitCode is null,
             $"migrate must not have exited before release; exitCode={heldMigrate.ExitCode}");
 
-        // Release migration; require a successful exit before the API may serve.
         await host.ResourceCommandAsync("migrate", "start", cts.Token);
         var migrateExit = await host.WaitForExitCodeAsync("migrate", cts.Token);
         Assert.Equal(0, migrateExit);
@@ -312,23 +311,7 @@ internal sealed class AspireHost : IAsyncDisposable
     {
         var json = await DescribeAsync(resource, cancellationToken);
         using var doc = JsonDocument.Parse(json);
-        var root = doc.RootElement;
-        JsonElement element = root;
-        if (root.TryGetProperty("resources", out var resources) && resources.GetArrayLength() > 0)
-        {
-            element = resources.EnumerateArray().FirstOrDefault(r =>
-            {
-                var name = r.TryGetProperty("name", out var n) ? n.GetString() : null;
-                var display = r.TryGetProperty("displayName", out var d) ? d.GetString() : null;
-                return string.Equals(display, resource, StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(name, resource, StringComparison.OrdinalIgnoreCase)
-                    || (name?.StartsWith(resource + "-", StringComparison.OrdinalIgnoreCase) ?? false);
-            });
-            if (element.ValueKind == JsonValueKind.Undefined)
-            {
-                element = resources[0];
-            }
-        }
+        var element = RequireUniqueResource(doc.RootElement, resource, json);
 
         int? exitCode = null;
         if (element.TryGetProperty("exitCode", out var exitEl))
@@ -355,6 +338,47 @@ internal sealed class AspireHost : IAsyncDisposable
             Raw = json,
             Root = element.Clone(),
         };
+    }
+
+    /// <summary>
+    /// Resolves exactly one resource for the logical name. Never falls back to resources[0].
+    /// </summary>
+    private static JsonElement RequireUniqueResource(JsonElement root, string logicalName, string rawJson)
+    {
+        static bool Matches(JsonElement r, string logicalName)
+        {
+            var name = r.TryGetProperty("name", out var n) ? n.GetString() : null;
+            var display = r.TryGetProperty("displayName", out var d) ? d.GetString() : null;
+            return string.Equals(display, logicalName, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(name, logicalName, StringComparison.OrdinalIgnoreCase)
+                || (name?.StartsWith(logicalName + "-", StringComparison.OrdinalIgnoreCase) ?? false);
+        }
+
+        if (root.TryGetProperty("resources", out var resources) && resources.ValueKind == JsonValueKind.Array)
+        {
+            var matches = resources.EnumerateArray().Where(r => Matches(r, logicalName)).ToList();
+            if (matches.Count == 0)
+            {
+                throw new InvalidOperationException(
+                    $"No resource matched logical name '{logicalName}'; refusing ownership. describe={rawJson}");
+            }
+
+            if (matches.Count > 1)
+            {
+                throw new InvalidOperationException(
+                    $"Ambiguous resource name '{logicalName}' matched {matches.Count} entries; refusing ownership. describe={rawJson}");
+            }
+
+            return matches[0];
+        }
+
+        if (Matches(root, logicalName))
+        {
+            return root;
+        }
+
+        throw new InvalidOperationException(
+            $"Describe payload for '{logicalName}' did not contain a uniquely matching resource; refusing ownership. describe={rawJson}");
     }
 
     public async Task<string> DescribeAsync(string resource, CancellationToken cancellationToken)

@@ -30,8 +30,18 @@ if ($todosResponse.StatusCode -ne 200) {
 }
 
 $todosContent = [string]$todosResponse.Content
-if (-not $todosContent.TrimStart().StartsWith('[')) {
-    throw "GET /api/todos expected a JSON array: $todosContent"
+try {
+    $todosJson = $todosContent | ConvertFrom-Json -NoEnumerate
+} catch {
+    throw "GET /api/todos returned non-JSON: $todosContent"
+}
+
+# ConvertFrom-Json turns JSON arrays into Object[]; a bare object would be PSCustomObject.
+if ($null -eq $todosJson) {
+    throw "GET /api/todos expected a JSON array, got null: $todosContent"
+}
+if ($todosJson -isnot [System.Array]) {
+    throw "GET /api/todos expected a JSON array root, got $($todosJson.GetType().FullName): $todosContent"
 }
 
 Write-Host "smoke ok: version=$($payload.version) commit=$($payload.commit) todos=$todosContent"
