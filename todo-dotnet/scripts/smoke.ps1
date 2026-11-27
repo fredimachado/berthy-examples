@@ -36,9 +36,10 @@ $todosResponse = Invoke-WebRequest -Uri $todosUrl -Method GET
 if ($todosResponse.StatusCode -ne 200) {
     throw "GET /api/todos returned $($todosResponse.StatusCode)"
 }
+# Warm Redis from a prior smoke run may already hold the list — first GET may be hit or miss.
 $firstCache = Get-CacheHeader $todosResponse
-if ($firstCache -ne 'miss') {
-    throw "first GET /api/todos X-Cache='$firstCache', want 'miss'"
+if ($firstCache -ne 'miss' -and $firstCache -ne 'hit') {
+    throw "first GET /api/todos X-Cache='$firstCache', want 'miss' or 'hit'"
 }
 
 $todosContent = [string]$todosResponse.Content
@@ -59,13 +60,15 @@ if ($todosJson -isnot [System.Array]) {
 # Assign the parsed array, then read .Length (do not wrap ConvertFrom-Json in @(...).Length).
 $beforeCount = $todosJson.Length
 
-$hitResponse = Invoke-WebRequest -Uri $todosUrl -Method GET
-if ($hitResponse.StatusCode -ne 200) {
-    throw "second GET /api/todos returned $($hitResponse.StatusCode)"
-}
-$secondCache = Get-CacheHeader $hitResponse
-if ($secondCache -ne 'hit') {
-    throw "second GET /api/todos X-Cache='$secondCache', want 'hit'"
+if ($firstCache -eq 'miss') {
+    $hitResponse = Invoke-WebRequest -Uri $todosUrl -Method GET
+    if ($hitResponse.StatusCode -ne 200) {
+        throw "second GET /api/todos returned $($hitResponse.StatusCode)"
+    }
+    $secondCache = Get-CacheHeader $hitResponse
+    if ($secondCache -ne 'hit') {
+        throw "second GET /api/todos X-Cache='$secondCache', want 'hit'"
+    }
 }
 
 $createBody = '{"title":"  buy milk  "}'

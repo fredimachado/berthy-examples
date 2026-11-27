@@ -11,6 +11,7 @@ internal sealed record TodoListResult(TodoResponse[] Items, bool CacheHit);
 internal sealed class TodoListCache
 {
     internal const string Key = "todo:list";
+    internal const string TokenPrefix = "tok:";
     internal static readonly TimeSpan ListTtl = TimeSpan.FromSeconds(60);
     internal static readonly TimeSpan TokenTtl = TimeSpan.FromSeconds(10);
     internal static readonly TimeSpan InvalidationTimeout = TimeSpan.FromSeconds(2);
@@ -38,6 +39,7 @@ internal sealed class TodoListCache
     {
         var redis = TryDatabase();
         RedisValue? corrupt = null;
+        var liveToken = false;
 
         if (redis is not null)
         {
@@ -46,13 +48,20 @@ internal sealed class TodoListCache
                 var cached = await redis.StringGetAsync(Key).WaitAsync(ct);
                 if (cached.HasValue)
                 {
-                    if (TryParseList(cached, out var items))
+                    if (IsFillToken(cached))
+                    {
+                        // Another reader reserved the key; leave the token alone.
+                        liveToken = true;
+                    }
+                    else if (TryParseList(cached, out var items))
                     {
                         return new TodoListResult(items, CacheHit: true);
                     }
-
-                    // Unreadable / token / corrupt: treat as miss and CAS-replace with a token.
-                    corrupt = cached;
+                    else
+                    {
+                        // Unreadable / corrupt: CAS-replace with a token.
+                        corrupt = cached;
+                    }
                 }
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -63,9 +72,9 @@ internal sealed class TodoListCache
         }
 
         string? token = null;
-        if (redis is not null)
+        if (redis is not null && !liveToken)
         {
-            token = "tok:" + Guid.NewGuid().ToString("N");
+            token = TokenPrefix + Guid.NewGuid().ToString("N");
             try
             {
                 if (corrupt is { } old)
@@ -166,6 +175,18 @@ internal sealed class TodoListCache
         }
     }
 
+    internal static bool IsFillToken(RedisValue value)
+    {
+        if (!value.HasValue)
+        {
+            return false;
+        }
+
+        var text = (string?)value;
+        return text is not null
+            && text.StartsWith(TokenPrefix, StringComparison.Ordinal);
+    }
+
     private static bool TryParseList(RedisValue value, out TodoResponse[] items)
     {
         items = [];
@@ -175,7 +196,6 @@ internal sealed class TodoListCache
         }
 
         var bytes = (byte[])value!;
-        // Fill tokens are not JSON arrays.
         if (bytes.Length == 0 || bytes[0] != (byte)'[')
         {
             return false;
@@ -183,8 +203,22 @@ internal sealed class TodoListCache
 
         try
         {
-            var parsed = JsonSerializer.Deserialize<TodoResponse[]>(bytes, JsonOptions);
-            items = parsed ?? [];
+            var parsed = JsonSerializer.Deserialize<TodoResponse?[]>(bytes, JsonOptions);
+            if (parsed is null)
+            {
+                return false;
+            }
+
+            // Reject malformed hits such as [null] — treat as corrupt and refill.
+            for (var i = 0; i < parsed.Length; i++)
+            {
+                if (parsed[i] is null)
+                {
+                    return false;
+                }
+            }
+
+            items = parsed!;
             return true;
         }
         catch (JsonException)

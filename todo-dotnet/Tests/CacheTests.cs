@@ -205,7 +205,7 @@ public sealed class CacheTests
 
             var before = await RedisAdmin.ReadListSnapshotAsync(apiRedis.AdminConnectionString);
             Assert.NotNull(before.Bytes);
-            Assert.True(before.Ttl > TimeSpan.Zero && before.Ttl <= TimeSpan.FromSeconds(60));
+            Assert.True(before.ExpireAtUnixMs > 0, $"PEXPIRETIME before={before.ExpireAtUnixMs}");
 
             await RedisAcl.DenyDeleteAsync(apiRedis.AdminConnectionString, apiRedis.Username);
 
@@ -228,10 +228,7 @@ public sealed class CacheTests
 
             var afterFailedDel = await RedisAdmin.ReadListSnapshotAsync(apiRedis.AdminConnectionString);
             Assert.Equal(before.Bytes, afterFailedDel.Bytes);
-            Assert.True(
-                Math.Abs((afterFailedDel.Ttl - before.Ttl).TotalSeconds) < 5,
-                $"TTL refreshed or lost: before={before.Ttl} after={afterFailedDel.Ttl}");
-            Assert.True(afterFailedDel.Ttl > TimeSpan.Zero);
+            Assert.Equal(before.ExpireAtUnixMs, afterFailedDel.ExpireAtUnixMs);
 
             using (var stale = await client.GetAsync("/api/todos"))
             {
@@ -308,6 +305,95 @@ public sealed class CacheTests
     }
 
     [Fact]
+    public async Task LiveFillTokenIsNotReplacedByConcurrentReader()
+    {
+        await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
+        Assert.Equal(0, (await MigrateProcess.RunAsync(database.ConnectionString)).ExitCode);
+        await RedisAdmin.FlushListKeyAsync(_services.RedisConnectionString);
+
+        await using var factory = CreateFactory(database.ConnectionString);
+        var client = factory.CreateClient();
+
+        var cache = factory.Services.GetRequiredService<TodoListCache>();
+        var readReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFill = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pauseOnce = 0;
+        cache.AfterDatabaseReadAsync = async ct =>
+        {
+            // Only the first miss pauses; a concurrent reader must not deadlock on the same barrier.
+            if (Interlocked.Exchange(ref pauseOnce, 1) != 0)
+            {
+                return;
+            }
+
+            readReached.TrySetResult();
+            await releaseFill.Task.WaitAsync(ct);
+        };
+
+        var first = client.GetAsync("/api/todos");
+        await readReached.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        var token = await RedisAdmin.ReadRawAsync(_services.RedisConnectionString);
+        Assert.True(TodoListCache.IsFillToken(token), $"expected fill token, got {token}");
+
+        // Second GET must leave the first reader's token alone and still return a miss.
+        using (var second = await client.GetAsync("/api/todos"))
+        {
+            Assert.Equal(HttpStatusCode.OK, second.StatusCode);
+            Assert.Equal("miss", GetCacheHeader(second));
+            Assert.Equal("[]", await second.Content.ReadAsStringAsync());
+        }
+
+        var tokenAfterSecond = await RedisAdmin.ReadRawAsync(_services.RedisConnectionString);
+        Assert.Equal(token, tokenAfterSecond);
+
+        releaseFill.TrySetResult();
+        using (var firstResponse = await first)
+        {
+            Assert.Equal(HttpStatusCode.OK, firstResponse.StatusCode);
+            Assert.Equal("miss", GetCacheHeader(firstResponse));
+        }
+
+        cache.AfterDatabaseReadAsync = null;
+
+        using (var hit = await client.GetAsync("/api/todos"))
+        {
+            Assert.Equal(HttpStatusCode.OK, hit.StatusCode);
+            Assert.Equal("hit", GetCacheHeader(hit));
+            Assert.Equal("[]", await hit.Content.ReadAsStringAsync());
+        }
+    }
+
+    [Fact]
+    public async Task MalformedCachedListIsRejectedAndRefilled()
+    {
+        await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
+        Assert.Equal(0, (await MigrateProcess.RunAsync(database.ConnectionString)).ExitCode);
+
+        await using var factory = CreateFactory(database.ConnectionString);
+        var client = factory.CreateClient();
+
+        // Seed after ApiFactory construction — the factory flushes todo:list on create.
+        await RedisAdmin.SetListBytesAsync(
+            _services.RedisConnectionString,
+            "[null]"u8.ToArray());
+
+        using (var miss = await client.GetAsync("/api/todos"))
+        {
+            Assert.Equal(HttpStatusCode.OK, miss.StatusCode);
+            Assert.Equal("miss", GetCacheHeader(miss));
+            Assert.Equal("[]", await miss.Content.ReadAsStringAsync());
+        }
+
+        using (var hit = await client.GetAsync("/api/todos"))
+        {
+            Assert.Equal(HttpStatusCode.OK, hit.StatusCode);
+            Assert.Equal("hit", GetCacheHeader(hit));
+            Assert.Equal("[]", await hit.Content.ReadAsStringAsync());
+        }
+    }
+
+    [Fact]
     public async Task RedisFailureFallsBackToPostgres()
     {
         await using var database = await IsolatedDatabase.CreateAsync(_services.PostgresConnectionString);
@@ -350,12 +436,11 @@ public sealed class CacheTests
             }
         }
 
-        await RedisAdmin.FlushListKeyAsync(_services.RedisConnectionString);
-        await RedisAdmin.SetListBytesAsync(_services.RedisConnectionString, "{not-json"u8.ToArray());
-
+        // Seed corrupt bytes after ApiFactory so the constructor flush cannot wipe them.
         await using (var factory = CreateFactory(database.ConnectionString))
         {
             var client = factory.CreateClient();
+            await RedisAdmin.SetListBytesAsync(_services.RedisConnectionString, "{not-json"u8.ToArray());
 
             using (var miss = await client.GetAsync("/api/todos"))
             {
@@ -445,15 +530,22 @@ internal static class RedisAdmin
         return ttl.Value;
     }
 
-    internal static async Task<(byte[]? Bytes, TimeSpan Ttl)> ReadListSnapshotAsync(string connectionString)
+    internal static async Task<(byte[]? Bytes, long ExpireAtUnixMs)> ReadListSnapshotAsync(
+        string connectionString)
     {
         using var mux = await ConnectAsync(connectionString);
         var db = mux.GetDatabase();
         var value = await db.StringGetAsync(ListKey);
-        var ttl = await db.KeyTimeToLiveAsync(ListKey);
         Assert.True(value.HasValue);
-        Assert.True(ttl.HasValue);
-        return ((byte[]?)value, ttl.Value);
+        var expireAt = (long)await db.ExecuteAsync("PEXPIRETIME", ListKey);
+        Assert.True(expireAt > 0, $"PEXPIRETIME={expireAt}");
+        return ((byte[]?)value, expireAt);
+    }
+
+    internal static async Task<RedisValue> ReadRawAsync(string connectionString)
+    {
+        using var mux = await ConnectAsync(connectionString);
+        return await mux.GetDatabase().StringGetAsync(ListKey);
     }
 
     internal static async Task SetListBytesAsync(string connectionString, byte[] bytes)
